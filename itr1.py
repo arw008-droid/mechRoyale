@@ -1,5 +1,16 @@
-"""v4: v1's proven scoring + better mechanics (evasive movement, beam dodge,
-reactive jumping, sound awareness, cover system, obstacle avoidance)."""
+"""v5: Stealth-first survival strategy.
+Key insight: in 1v15, every shot broadcasts your position to the entire squad.
+Changes from v4:
+  1. FIRE DISCIPLINE: only fire when close (<25m open, <40m from cover) or when
+     already being shot at. Silent bot is harder to find.
+  2. EARLY-GAME SPRINT: first ~15s, sprint to nearest building. Don't loot, fight.
+  3. SUPPLY DROP awareness: drops provide cubes + repair, worth contesting when safe.
+  4. FIX: aim prediction uses the FIRING weapon's speed, not always slot 0.
+  5. IMPROVED LEAD: 2-iteration lead prediction for better accuracy.
+  6. RETREAT-FIRE: when fleeing, only fire if enemy <20m (too close to hide anyway).
+  7. ZONE-EDGE camping: stay near zone edge away from center where enemies converge.
+  8. SOUND-BASED ROTATION: move away from sound clusters even without visual contact.
+"""
 import json
 import math
 import os
@@ -8,7 +19,7 @@ import mechfight as mf
 
 
 # =========================================================================
-# ARENA MAP
+# ARENA MAP (same as v4)
 # =========================================================================
 class ArenaMap:
     CELL = 40
@@ -73,12 +84,9 @@ class ArenaMap:
         mx, my_ = my_pos[0], my_pos[1]
         ex, ey = enemy_pos[0], enemy_pos[1]
         best, best_sc = None, float("inf")
-
-        # how far WE are from zone center (for penalizing cover that's farther out)
         my_zone_dist = 0.0
         if zone_center:
             my_zone_dist = math.hypot(mx - zone_center[0], my_ - zone_center[1])
-
         for prism in self.nearby(mx, my_, max_dist):
             pcx, pcy = prism["cx"], prism["cy"]
             verts = prism["verts"]
@@ -100,23 +108,31 @@ class ArenaMap:
                 if ol < 0.1:
                     continue
                 cx_, cy_ = px + ox / ol * 3.0, py + oy / ol * 3.0
-
-                # hard filter: cover must be inside 92% of next zone
                 if zone_center and zone_radius:
                     if math.hypot(cx_ - zone_center[0],
                                   cy_ - zone_center[1]) > zone_radius * 0.92:
                         continue
-
-                # scoring: distance to me + penalty for running away from zone
                 dist = math.hypot(cx_ - mx, cy_ - my_)
                 if zone_center:
                     cover_zone_dist = math.hypot(cx_ - zone_center[0],
                                                   cy_ - zone_center[1])
-                    # penalize cover that's farther from zone center than we are
                     if cover_zone_dist > my_zone_dist:
                         dist += (cover_zone_dist - my_zone_dist) * 0.8
                 if dist < best_sc:
                     best_sc, best = dist, (cx_, cy_)
+        return best
+
+    def nearest_building(self, x, y, max_dist=120):
+        """Find nearest building center — for early-game sprint."""
+        best, best_d = None, float("inf")
+        for prism in self.nearby(x, y, max_dist):
+            d = math.hypot(prism["cx"] - x, prism["cy"] - y)
+            # only consider substantial buildings
+            if prism["top"] - prism["base"] < 5:
+                continue
+            if d < best_d and d > 3:  # don't pick one we're already on
+                best_d = d
+                best = (prism["cx"], prism["cy"])
         return best
 
     def is_blocked(self, x, y):
@@ -180,7 +196,7 @@ class ArenaMap:
 # BOT
 # =========================================================================
 class Bot:
-    name = "ghost-v4"
+    name = "ghost-v5"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
@@ -199,7 +215,7 @@ class Bot:
         self.stuck_ticks = 0
         self.kill_count = 0
 
-        # v2 additions
+        # damage tracking
         self.dmg_ticks = []
         self.move_phase = 0.0
         self.dodge_amplitude = self.rng.uniform(0.3, 0.6)
@@ -207,6 +223,29 @@ class Bot:
         # cover cache
         self._cover_pt = None
         self._cover_tick = -99
+
+        # v5: track if we're being actively targeted
+        self._taking_fire = False
+        self._last_damaged_tick = -100
+
+        # v5: early-game sprint target
+        self._sprint_target = None
+
+        # Extract useful config values
+        mech_cfg = self.config.get("mech", {})
+        self.rear_mult = mech_cfg.get("rear_mult", 1.5)
+        self.turn_rate = mech_cfg.get("turn_rate", 3.0)
+
+        # Vision config — know our FOV
+        vis = self.config.get("vision", {})
+        self.fov_deg = vis.get("fov_deg", 120)
+        self.vision_range = vis.get("range", 100)
+        self.near_range = vis.get("near_range", 15)
+
+        # Sound ranges for awareness
+        snd = self.config.get("sound", {})
+        self.sound_near = snd.get("near", 30)
+        self.sound_mid = snd.get("mid", 80)
 
     # =====================================================================
     # VECTOR MATH
@@ -275,7 +314,6 @@ class Bot:
         return len(self.dmg_ticks)
 
     def _recent_damage_events(self, obs):
-        """Count damage events THIS tick (for scoring, like v1)."""
         return sum(1 for e in obs.get("events", []) if e.get("type") == "damaged")
 
     def _sound_threat(self, obs):
@@ -285,6 +323,23 @@ class Bot:
         mid = sum(1 for s in obs["sounds"]
                   if s["dist"] == "mid" and s["kind"] in ("step", "gun"))
         return near + mid * 0.5
+
+    def _sound_direction(self, obs):
+        """Get weighted direction AWAY from sound sources."""
+        me = obs["self"]
+        fx, fy = 0.0, 0.0
+        for s in obs["sounds"]:
+            if s["kind"] not in ("step", "gun", "mortar", "laser", "lightning"):
+                continue
+            w = 3.0 if s["dist"] == "near" else (1.0 if s["dist"] == "mid" else 0.3)
+            # bearing is relative to our aim direction
+            abs_bearing = s["bearing"]
+            fx -= math.cos(abs_bearing) * w
+            fy -= math.sin(abs_bearing) * w
+        L = math.hypot(fx, fy)
+        if L < 0.1:
+            return None
+        return [fx / L, fy / L]
 
     def _matchup_bonus(self, me, enemy):
         my2 = self._w2(me) or "gun"
@@ -333,7 +388,6 @@ class Bot:
             self._cover_tick = tick
             return None
         me = obs["self"]
-        # weighted enemy centroid
         wx, wy, wt = 0.0, 0.0, 0.0
         for e in enemies[:4]:
             d = max(self._d2(me["pos"], e["pos"]), 1.0)
@@ -351,8 +405,13 @@ class Bot:
         self._cover_tick = tick
         return self._cover_pt
 
+    # v5: check if a damage event came from behind (rear damage multiplier)
+    def _rear_hits(self, obs):
+        return sum(1 for e in obs.get("events", [])
+                   if e.get("type") == "damaged" and e.get("rear", False))
+
     # =====================================================================
-    # UPGRADE — more survival-biased than v1
+    # UPGRADE — survival-biased
     # =====================================================================
     def _choose_upgrade(self, offer, me):
         hp = self._hp(me)
@@ -374,11 +433,10 @@ class Bot:
         return best_i
 
     # =====================================================================
-    # SCORING — based on v1 (which scored 1.36), with targeted tweaks
+    # SCORING — v1 base + stealth philosophy
     # =====================================================================
 
     def _score_zone(self, obs):
-        """SAME as v1."""
         me = obs["self"]
         margin = self._zone_margin(obs)
         score = 5.0
@@ -396,7 +454,7 @@ class Bot:
         return score
 
     def _score_fight(self, obs):
-        """v1 base + slightly more cautious about groups."""
+        """v1 base + STEALTH: heavily penalize fighting when not being shot at."""
         enemies = self._enemies(obs)
         if not enemies:
             return -50.0
@@ -406,62 +464,80 @@ class Bot:
         nearby = self._nearby_count(obs, 40)
         alive = obs.get("alive", 16)
 
-        score = hp * 30.0                              # v1: same
-        score += (1.0 - alive / 16.0) * 20.0           # v1: same
+        score = hp * 30.0
+        score += (1.0 - alive / 16.0) * 20.0
         if self._w2(me):
-            score += 15.0                               # v1: same
-        score += min(me["cubes"], 10) * 3.0             # v1: same
+            score += 15.0
+        score += min(me["cubes"], 10) * 3.0
 
-        # TWEAK: slightly harsher multi-enemy penalty
-        score -= nearby * 18.0                          # v1 was 14
+        score -= nearby * 18.0
 
         if nearest_d < 15:
-            score += 12.0                               # v1: same
+            score += 12.0
         elif nearest_d < 50:
-            score += 6.0                                # v1: same
+            score += 6.0
         elif nearest_d > 90:
-            score -= 15.0                               # v1: same
+            score -= 15.0
 
-        score += self._matchup_bonus(me, enemies[0])    # v1: same
+        score += self._matchup_bonus(me, enemies[0])
 
         if hp < 0.35:
-            score -= 40.0                               # v1: same
-        score -= self._recent_damage_events(obs) * 8.0  # v1: same
+            score -= 40.0
+        score -= self._recent_damage_events(obs) * 8.0
 
-        # NEW: bonus for fighting from cover (peek-shoot is safer)
-        if self._behind_cover(obs) and nearest_d < 45:
-            score += 15.0
+        # v5: STEALTH — big penalty for fighting when enemy is far away
+        # Only commit to fights that are unavoidable or very advantageous
+        if not self._taking_fire:
+            # We're not being shot at — strong incentive to stay silent
+            if nearest_d > 30:
+                score -= 35.0  # don't engage distant enemies unprovoked
+            elif nearest_d > 20:
+                score -= 20.0
+        else:
+            # Being shot at — fight back is justified, bonus for cover
+            if self._behind_cover(obs) and nearest_d < 45:
+                score += 15.0
 
-        # NEW: extra penalty when 3+ enemies nearby
+        # penalty when outnumbered
         if nearby >= 3:
-            score -= 20.0
+            score -= 25.0
+        elif nearby >= 2:
+            score -= 10.0
+
+        # v5: late-game aggression when few alive (need to fight eventually)
+        if alive <= 5 and hp > 0.5:
+            score += 20.0
 
         return score
 
     def _score_flee(self, obs):
-        """v1 base + sound awareness + slightly higher damage multiplier."""
+        """v1 base + sound awareness."""
         me = obs["self"]
         hp = self._hp(me)
         nearby = self._nearby_count(obs, 35)
         sounds = self._sound_threat(obs)
 
-        score = (1.0 - hp) * 50.0                      # v1: same
-        score += self._recent_damage_events(obs) * 22.0 # v1 was 18
-        score += max(0, nearby - 1) * 16.0              # v1: same
+        score = (1.0 - hp) * 50.0
+        score += self._recent_damage_events(obs) * 22.0
+        score += max(0, nearby - 1) * 16.0
         if me["energy"] < 25:
-            score += 10.0                               # v1: same
-        score -= hp * 25.0                              # v1: same
+            score += 10.0
+        score -= hp * 25.0
         if nearby == 0:
-            score -= 30.0                               # v1: same
+            score -= 30.0
 
-        # NEW: sound-based pre-emption
+        # sound-based pre-emption
         if sounds > 1 and nearby == 0:
+            score += 15.0
+
+        # v5: flee is attractive when multiple enemies visible (don't engage 1v2+)
+        if nearby >= 2:
             score += 15.0
 
         return score
 
     def _score_cover(self, obs):
-        """NEW: seek cover when taking fire and cover is nearby."""
+        """Seek cover when taking fire and cover is nearby."""
         enemies = self._enemies(obs)
         if not enemies or not self.arena.loaded:
             return -50.0
@@ -470,12 +546,11 @@ class Bot:
         nearby = self._nearby_count(obs, 45)
         margin = self._zone_margin(obs)
 
-        # zone is tight — don't chase cover, prioritize zone positioning
         if margin < 15 or not me["in_zone"]:
             return -50.0
 
         if self._behind_cover(obs):
-            return -10.0  # already covered, let fight/flee/zone decide
+            return -10.0
 
         cover = self._get_cover(obs)
         if cover is None:
@@ -484,16 +559,13 @@ class Bot:
         cover_dist = math.hypot(cover[0] - me["pos"][0], cover[1] - me["pos"][1])
         score = 0.0
 
-        # cover matters most when actively taking damage
         if dps > 0:
             score += 40.0 + dps * 10.0
-        # or when outnumbered
         if nearby >= 2:
             score += 20.0 + nearby * 8.0
         elif nearby == 1:
             score += 10.0
 
-        # close cover is more attractive
         if cover_dist < 15:
             score += 15.0
         elif cover_dist > 40:
@@ -502,14 +574,37 @@ class Bot:
         if self._hp(me) < 0.4:
             score += 20.0
 
-        # zone pressure: reduce cover urgency as margin shrinks
+        # v5: ALWAYS want cover when enemies visible and not taking fire
+        # (staying hidden > everything except zone)
+        if not self._taking_fire and nearby > 0 and cover_dist < 25:
+            score += 25.0  # strong incentive to get behind cover proactively
+
         if margin < 30:
-            score -= (30.0 - margin) * 1.0  # up to -15 penalty at margin=15
+            score -= (30.0 - margin) * 1.0
 
         return score
 
+    def _score_stealth(self, obs):
+        """v5 NEW: when no enemies visible but sounds indicate nearby threats,
+        move AWAY from sounds and toward cover. Pure evasion."""
+        enemies = self._enemies(obs)
+        if enemies:
+            return -50.0  # other behaviors handle visible enemies
+        sounds = self._sound_threat(obs)
+        if sounds < 0.5:
+            return -50.0  # nothing nearby, don't bother
+        me = obs["self"]
+        margin = self._zone_margin(obs)
+        if margin < 15 or not me["in_zone"]:
+            return -50.0
+
+        score = 20.0 + sounds * 15.0
+        # boost when behind cover already (hold position)
+        if self._behind_cover(obs):
+            score += 10.0
+        return score
+
     def _score_loot_weapon(self, obs):
-        """SAME as v1."""
         me = obs["self"]
         if self._w2(me):
             return -20.0
@@ -531,10 +626,12 @@ class Bot:
             score -= enemies_close * 12.0
         if obs.get("t", 0) < 90:
             score += 15.0
+        # v5: DON'T run across open ground for weapons when enemies audible
+        if self._sound_threat(obs) > 1 and best_d > 25:
+            score -= 25.0
         return score
 
     def _score_loot_cubes(self, obs):
-        """SAME as v1."""
         me = obs["self"]
         need = me["cubes"] < self._next_up_cost(me)
         mep = me["pos"]
@@ -546,10 +643,12 @@ class Bot:
         score -= self._nearby_count(obs, 35) * 10.0
         if obs.get("t", 0) > 200:
             score *= 0.6
+        # v5: don't loot when threats around (stealth priority)
+        if self._sound_threat(obs) > 1:
+            score -= 15.0
         return score
 
     def _score_hunt_npc(self, obs):
-        """SAME as v1."""
         npcs = self._npcs(obs)
         if not npcs:
             return -60.0
@@ -563,13 +662,42 @@ class Bot:
             score += 25.0
         score -= d * 0.35
         score -= self._nearby_count(obs, 45) * 18.0
+        # v5: only hunt NPCs when no enemy sounds nearby
+        if self._sound_threat(obs) > 1:
+            score -= 20.0
+        return score
+
+    def _score_drop(self, obs):
+        """v5 NEW: contest supply drops for cubes + repair."""
+        drops = obs.get("drops", [])
+        if not drops:
+            return -60.0
+        me = obs["self"]
+        # find closest active drop
+        best_drop = None
+        best_d = float("inf")
+        for dr in drops:
+            d = self._d2(me["pos"], dr["pos"])
+            if d < best_d:
+                best_d = d
+                best_drop = dr
+        if best_drop is None or best_d > 80:
+            return -50.0
+        score = 30.0 - best_d * 0.5
+        # safer to contest when fewer enemies nearby
+        if self._nearby_count(obs, 40) == 0:
+            score += 20.0
+        elif self._nearby_count(obs, 40) >= 2:
+            score -= 30.0
+        # HP healing makes drops more valuable when hurt
+        if self._hp(me) < 0.6:
+            score += 15.0
         return score
 
     # =====================================================================
-    # MOVEMENT — UPGRADED from v1
+    # MOVEMENT
     # =====================================================================
     def _evasive_move(self, obs, base_dir):
-        """Sinusoidal dodge overlay — replaces v1's fixed strafe."""
         self.strafe_ticks += 1
         if self.strafe_ticks >= self.strafe_flip_at:
             self.strafe_dir *= -1
@@ -586,7 +714,6 @@ class Bot:
                          base_dir[1] * 0.55 + perp[1] * sin_off])
 
     def _dodge_dir(self, obs):
-        """v1 projectile dodge + beam dodge + laser charge dodge."""
         me = obs["self"]
         mx, my_ = me["pos"][0], me["pos"][1]
 
@@ -660,14 +787,16 @@ class Bot:
         return move
 
     def _zone_goal(self, obs):
-        """Enemy-aware zone positioning (upgraded from v1)."""
+        """v5: Zone-EDGE positioning — stay at edge away from threats.
+        Center is where everyone converges. Edge gives more escape routes."""
         me = obs["self"]
         c = obs["zone"].get("next_center", obs["zone"]["center"])
         r = obs["zone"].get("next_radius", obs["zone"]["radius"])
         threat = self._threat_dir(obs)
         if threat and r > 10:
             away = [-threat[0], -threat[1]]
-            target_r = r * 0.5
+            # v5: aim for 65% of radius instead of 50% — stay closer to edge
+            target_r = r * 0.65
             goal = [c[0] + away[0] * target_r, c[1] + away[1] * target_r]
             if self.arena.loaded and self.arena.is_blocked(goal[0], goal[1]):
                 steer = self.arena.steer_around(me["pos"][0], me["pos"][1],
@@ -676,7 +805,13 @@ class Bot:
                     goal = [me["pos"][0] + steer[0] * target_r,
                             me["pos"][1] + steer[1] * target_r]
             return goal + [me["pos"][2]]
-        # fallback: v1 style
+        # no threats: go to edge away from sounds
+        sound_dir = self._sound_direction(obs)
+        if sound_dir and r > 10:
+            target_r = r * 0.6
+            goal = [c[0] + sound_dir[0] * target_r, c[1] + sound_dir[1] * target_r]
+            return goal + [me["pos"][2]]
+        # fallback
         dx = me["pos"][0] - c[0]
         dy = me["pos"][1] - c[1]
         d = math.hypot(dx, dy)
@@ -691,14 +826,13 @@ class Bot:
         fx, fy = 0.0, 0.0
         for e in enemies[:4]:
             d = max(self._d2(me["pos"], e["pos"]), 1.0)
-            w = 1.0 / d                                # v1: same (linear, not inverse-square)
+            w = 1.0 / d
             fx += (me["pos"][0] - e["pos"][0]) * w
             fy += (me["pos"][1] - e["pos"][1]) * w
         flee = self._n2([fx, fy])
         zone_dir = self._toward(me["pos"], self._zone_goal(obs))
         margin = self._zone_margin(obs)
 
-        # NEW: blend toward cover if available AND zone isn't pinching us
         if margin > 25:
             cover = self._get_cover(obs)
             if cover:
@@ -710,18 +844,27 @@ class Bot:
         return self._blend(flee, zone_dir, 0.65, 0.35)
 
     # =====================================================================
-    # COMBAT — v1 base + gun range/ammo limits
+    # COMBAT — v5: stealth-aware
     # =====================================================================
-    def _lead(self, me, tgt):
+    def _lead(self, me, tgt, weapon_kind=None):
+        """v5: 2-iteration lead prediction, uses correct weapon speed."""
         dist = self._d2(me["pos"], tgt["pos"])
-        w0 = me["weapons"][0]
-        kind = w0["kind"] if w0 else "gun"
-        speed = 999.0 if kind in ("laser", "lightning") else \
-                self.weapon_cfgs.get(kind, {}).get("speed", 80)
+        if weapon_kind is None:
+            w0 = me["weapons"][0]
+            weapon_kind = w0["kind"] if w0 else "gun"
+        speed = 999.0 if weapon_kind in ("laser", "lightning") else \
+                self.weapon_cfgs.get(weapon_kind, {}).get("speed", 80)
+        # iteration 1
         t = dist / max(speed, 1.0)
-        return [tgt["pos"][0] + tgt["vel"][0] * t,
+        pred = [tgt["pos"][0] + tgt["vel"][0] * t,
                 tgt["pos"][1] + tgt["vel"][1] * t,
                 tgt["pos"][2] + tgt["vel"][2] * t * 0.5]
+        # iteration 2 — refine with new distance
+        dist2 = self._d2(me["pos"], pred)
+        t2 = dist2 / max(speed, 1.0)
+        return [tgt["pos"][0] + tgt["vel"][0] * t2,
+                tgt["pos"][1] + tgt["vel"][1] * t2,
+                tgt["pos"][2] + tgt["vel"][2] * t2 * 0.5]
 
     def _aim_at(self, me, pos):
         yaw = self._yaw(me["pos"], pos)
@@ -730,7 +873,6 @@ class Bot:
         return [yaw, pitch]
 
     def _best_fight_target(self, obs):
-        """v1: target selection by HP + distance."""
         me = obs["self"]
         candidates = []
         for e in self._enemies(obs):
@@ -745,7 +887,7 @@ class Bot:
         return max(candidates, key=lambda x: x[0])[1]
 
     def _fire_slots(self, me, dist):
-        """v1 + gun ammo check + gun range limit."""
+        """v5: fire discipline — don't fire at distant enemies unless provoked."""
         f = [False, False]
         for slot in (0, 1):
             w = me["weapons"][slot] if slot < len(me["weapons"]) else None
@@ -756,12 +898,20 @@ class Bot:
             if cd > 0 and k != "laser":
                 continue
             if k == "gun" and w.get("ammo", 1) <= 0:
-                continue                               # NEW: ammo check
-            if k == "gun" and dist > 50:
-                continue                               # NEW: range limit
+                continue
+            # v5: tighter range limits based on stealth
+            if k == "gun":
+                max_range = 40.0 if self._taking_fire else 25.0
+                if dist > max_range:
+                    continue
             if k == "lightning" and dist > 42:
                 continue
             if k == "mortar" and dist < 8:
+                continue
+            # laser and mortar still fire at range since they're high-impact
+            if k == "mortar" and dist > 60:
+                continue
+            if k == "laser" and dist > 70:
                 continue
             f[slot] = True
         return f
@@ -797,16 +947,32 @@ class Bot:
             act["jump"] = obs["tick"] % 18 == 0
 
     def _exec_fight(self, obs, act):
-        """v1 fight executor + evasive movement."""
         me = obs["self"]
         tgt = self._best_fight_target(obs)
         if not tgt:
             self._exec_zone(obs, act)
             return
         d = self._d2(me["pos"], tgt["pos"])
-        pred = self._lead(me, tgt)
+
+        # v5: determine which weapon slot will fire for correct lead
+        fire = self._fire_slots(me, d)
+        firing_kind = None
+        for slot in (0, 1):
+            if fire[slot]:
+                w = me["weapons"][slot] if slot < len(me["weapons"]) else None
+                if w:
+                    firing_kind = w["kind"]
+                    break
+
+        pred = self._lead(me, tgt, firing_kind)
         act["aim"] = self._aim_at(me, pred)
+
         ideal = 28.0 if self._w2(me) == "lightning" else 45.0
+
+        # v5: When not taking fire, prefer to maintain distance (stealth)
+        if not self._taking_fire:
+            ideal = max(ideal, 35.0)  # don't rush in
+
         if d > ideal + 8:
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
             act["boost"] = d > 55
@@ -816,31 +982,28 @@ class Bot:
             act["move"] = self._evasive_move(obs, away)
         else:
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
-        act["fire"] = self._fire_slots(me, d)
+        act["fire"] = fire
         if any(act.get("fire", [])):
             mf.draw.line(me["pos"], tgt["pos"], "#ff5040")
 
     def _exec_flee(self, obs, act):
-        """v1 flee + evasive movement + reactive jumping."""
         enemies = self._enemies(obs)
         me = obs["self"]
         if enemies:
             act["move"] = self._evasive_move(obs, self._flee_dir(obs, enemies))
             act["aim"] = self._aim_at(me, enemies[0]["pos"])
-            # shoot back while fleeing if close
-            if self._d2(me["pos"], enemies[0]["pos"]) < 35:
+            # v5: STEALTH — only shoot back when VERY close (can't hide anyway)
+            if self._d2(me["pos"], enemies[0]["pos"]) < 20:
                 act["fire"] = self._fire_slots(me,
                     self._d2(me["pos"], enemies[0]["pos"]))
         else:
             goal = self._zone_goal(obs)
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], goal))
         act["boost"] = True
-        # reactive jump instead of fixed timer
         if self._recent_dps(obs) > 0 and me.get("grounded") and me["energy"] > 20:
             act["jump"] = True
 
     def _exec_cover(self, obs, act):
-        """Move to cover, hold position once there, shoot back."""
         me = obs["self"]
         cover = self._get_cover(obs)
         if cover is None:
@@ -856,7 +1019,10 @@ class Bot:
             tgt = enemies[0]
             pred = self._lead(me, tgt)
             act["aim"] = self._aim_at(me, pred)
-            if self._d2(me["pos"], tgt["pos"]) < 40:
+            # v5: only return fire from cover if taking fire or very close
+            if self._taking_fire and self._d2(me["pos"], tgt["pos"]) < 40:
+                act["fire"] = self._fire_slots(me, self._d2(me["pos"], tgt["pos"]))
+            elif self._d2(me["pos"], tgt["pos"]) < 15:
                 act["fire"] = self._fire_slots(me, self._d2(me["pos"], tgt["pos"]))
 
         if d_to_cover < 5:
@@ -866,6 +1032,39 @@ class Bot:
         if self._recent_dps(obs) > 0 and me.get("grounded") and me["energy"] > 20:
             act["jump"] = True
         mf.draw.line(me["pos"], [cover[0], cover[1], me["pos"][2]], "#40ff40")
+
+    def _exec_stealth(self, obs, act):
+        """v5 NEW: move away from sounds, toward cover, stay hidden."""
+        me = obs["self"]
+        # direction away from sounds
+        away = self._sound_direction(obs)
+        if away is None:
+            away = [0.0, 0.0]
+
+        zone_dir = self._toward(me["pos"], self._zone_goal(obs))
+        margin = self._zone_margin(obs)
+
+        # blend: away from sounds + toward zone goal
+        if margin < 30:
+            act["move"] = self._blend(away, zone_dir, 0.3, 0.7)
+        else:
+            act["move"] = self._blend(away, zone_dir, 0.6, 0.4)
+
+        # try to reach cover
+        cover = self._get_cover(obs)
+        if cover and not self._behind_cover(obs):
+            cover_dir = self._toward(me["pos"], cover)
+            d_to_cover = math.hypot(cover[0] - me["pos"][0], cover[1] - me["pos"][1])
+            if d_to_cover < 30:
+                act["move"] = self._blend(act["move"], cover_dir, 0.4, 0.6)
+
+        act["boost"] = False  # don't make boost sounds
+        # aim toward sound threat (ready to dodge)
+        if obs["sounds"]:
+            s = min(obs["sounds"],
+                    key=lambda s: 0 if s["dist"] == "near" else
+                                  1 if s["dist"] == "mid" else 2)
+            act["aim"] = [s["bearing"], 0.0]
 
     def _exec_loot_weapon(self, obs, act):
         me = obs["self"]
@@ -910,6 +1109,26 @@ class Bot:
         act["aim"] = self._aim_at(me, pred)
         act["fire"] = self._fire_slots(me, d)
 
+    def _exec_drop(self, obs, act):
+        """v5 NEW: move to supply drop, capture it."""
+        drops = obs.get("drops", [])
+        if not drops:
+            self._exec_zone(obs, act)
+            return
+        me = obs["self"]
+        dest = min(drops, key=lambda dr: self._d2(me["pos"], dr["pos"]))
+        d = self._d2(me["pos"], dest["pos"])
+        act["move"] = self._evasive_move(obs, self._toward(me["pos"], dest["pos"]))
+        act["boost"] = d > 20
+        # aim at nearest enemy while contesting
+        enemies = self._enemies(obs)
+        if enemies:
+            tgt = enemies[0]
+            pred = self._lead(me, tgt)
+            act["aim"] = self._aim_at(me, pred)
+            if self._d2(me["pos"], tgt["pos"]) < 30 and self._taking_fire:
+                act["fire"] = self._fire_slots(me, self._d2(me["pos"], tgt["pos"]))
+
     # =====================================================================
     # STATE
     # =====================================================================
@@ -921,6 +1140,10 @@ class Bot:
                 self.kill_count += 1
             if e.get("type") == "damaged":
                 self.dmg_ticks.append(tick)
+                self._last_damaged_tick = tick
+        # "taking fire" = damaged in last 2 seconds (20 ticks)
+        self._taking_fire = (tick - self._last_damaged_tick) < 20
+
         if self.last_pos and self._d2(me["pos"], self.last_pos) < 0.1:
             self.stuck_ticks += 1
         else:
@@ -951,14 +1174,44 @@ class Bot:
             mf.draw.label("UNSTICK")
             return act
 
+        # ============= v5: EARLY-GAME SPRINT TO COVER =============
+        t = obs.get("t", 0)
+        if t < 15 and self.arena.loaded:
+            # First 15 seconds: sprint to nearest building, ignore everything else
+            if self._sprint_target is None:
+                self._sprint_target = self.arena.nearest_building(
+                    me["pos"][0], me["pos"][1])
+            if self._sprint_target:
+                d_to_bldg = math.hypot(
+                    self._sprint_target[0] - me["pos"][0],
+                    self._sprint_target[1] - me["pos"][1])
+                if d_to_bldg > 5:
+                    base = self._toward(me["pos"], self._sprint_target)
+                    act["move"] = base
+                    act["boost"] = True
+                    # still pick up weapons if we pass over them
+                    # but don't fire, don't aim at enemies
+                    if obs["sounds"]:
+                        s = min(obs["sounds"],
+                                key=lambda s: 0 if s["dist"] == "near" else 1)
+                        act["aim"] = [s["bearing"], 0.0]
+                    act["move"] = self._apply_obstacle_avoidance(obs, act["move"])
+                    mf.draw.label(f"SPRINT d={d_to_bldg:.0f}")
+                    return act
+                else:
+                    self._sprint_target = None  # arrived, resume normal play
+
+        # ============= UTILITY SCORING =============
         scores = {
             "zone":        self._score_zone(obs),
             "fight":       self._score_fight(obs),
             "flee":        self._score_flee(obs),
             "cover":       self._score_cover(obs),
+            "stealth":     self._score_stealth(obs),
             "loot_weapon": self._score_loot_weapon(obs),
             "loot_cubes":  self._score_loot_cubes(obs),
             "hunt_npc":    self._score_hunt_npc(obs),
+            "drop":        self._score_drop(obs),
         }
         behavior = max(scores, key=scores.get)
 
@@ -967,9 +1220,11 @@ class Bot:
             "fight":       self._exec_fight,
             "flee":        self._exec_flee,
             "cover":       self._exec_cover,
+            "stealth":     self._exec_stealth,
             "loot_weapon": self._exec_loot_weapon,
             "loot_cubes":  self._exec_loot_cubes,
             "hunt_npc":    self._exec_hunt_npc,
+            "drop":        self._exec_drop,
         }
         executors[behavior](obs, act)
 
@@ -1002,9 +1257,10 @@ class Bot:
         margin = self._zone_margin(obs)
         top = sorted(scores.items(), key=lambda x: -x[1])[:3]
         behind = "C" if self._behind_cover(obs) else "X"
+        fire_status = "F!" if self._taking_fire else "ok"
         mf.draw.label(
             f"{behavior} {top[0][1]:.0f}|{top[1][1]:.0f}|{top[2][1]:.0f} "
-            f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} "
+            f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} {fire_status} "
             f"k{self.kill_count} a{obs['alive']}"
         )
         return act
