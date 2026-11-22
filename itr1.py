@@ -11,7 +11,7 @@ import mechfight as mf
 # ---------------------------------------------------------------------------
 TUNE = {
     "outnumbered_pen": 35.0,   # fight-score penalty per extra enemy (35 = back off at 2v1)
-    "recover_hp": 0.85,        # start hiding to regen below this hp fraction
+    "recover_hp": 0.6,        # start hiding to regen below this hp fraction
     "lone_bonus": 25.0,        # how hard to commit to 1v1s
     "weapon_prio": {"lightning": 4, "laser": 3, "mortar": 2, "gun": 1},
 }
