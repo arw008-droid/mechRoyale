@@ -1,31 +1,39 @@
-"""Utility-scored combat bot: fight, flee, loot, zone, NPC farm, by game state."""
+"""Utility-scored survival bot v2: survive first, fight only when cornered."""
 import math
 import random
 import mechfight as mf
 
 
 class Bot:
-    name = "ghost"
+    name = "ghost-v2"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
         self.reach = self.config["loot"]["pickup_radius"]
         self.rng = random.Random(hello["seed"])
         self.weapon_cfgs = self.config["weapons"]
-        self.zone_target_pct = 0.6
 
         self.weapon_prio = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
-        self.beats = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
 
         self.strafe_dir = 1
         self.strafe_ticks = 0
-        self.strafe_flip_at = self.rng.randint(6, 14)
+        self.strafe_flip_at = self.rng.randint(5, 12)
         self.last_pos = None
         self.stuck_ticks = 0
-        self.current_behavior = "init"
         self.kill_count = 0
 
-    # --- vector math ---
+        # --- track damage history for reactive decisions ---
+        self.dmg_ticks = []        # list of ticks we took damage
+        self.last_damage_bearing = None
+        self.hp_history = []       # rolling HP to detect burst damage
+
+        # --- movement unpredictability ---
+        self.move_phase = 0.0      # phase for sinusoidal dodge overlay
+        self.dodge_amplitude = self.rng.uniform(0.3, 0.6)
+
+    # =====================================================================
+    # VECTOR MATH (unchanged)
+    # =====================================================================
     def _dist2(self, a, b):
         return math.dist(a[:2], b[:2])
 
@@ -50,7 +58,13 @@ class Bot:
         y = self._yaw(src, dst)
         return [math.cos(y), math.sin(y)]
 
-    # --- queries ---
+    def _perp(self, v, direction=1):
+        """Perpendicular vector (rotated 90 degrees)."""
+        return [-v[1] * direction, v[0] * direction]
+
+    # =====================================================================
+    # QUERIES
+    # =====================================================================
     def _enemies(self, obs):
         me = obs["self"]
         return sorted(
@@ -69,200 +83,291 @@ class Bot:
         me = obs["self"]
         return obs["zone"]["radius"] - self._dist2(me["pos"], obs["zone"]["center"])
 
-    def _hp_ratio(self, me):
+    def _hp(self, me):
         return me["hp"] / max(me["max_hp"], 1.0)
 
-    def _nearby_enemies(self, obs, radius):
+    def _nearby_count(self, obs, radius):
         me = obs["self"]
         return sum(1 for e in self._enemies(obs) if self._dist2(me["pos"], e["pos"]) < radius)
 
-    def _next_upgrade_threshold(self, me):
+    def _next_upgrade_cost(self, me):
         t = self.config["cubes"]["upgrade_thresholds"]
         n = len(me["upgrades"])
         return t[n] if n < len(t) else float("inf")
 
-    def _secondary_kind(self, me):
+    def _weapon2(self, me):
         w = me["weapons"][1] if len(me["weapons"]) > 1 else None
         return w["kind"] if w else None
 
-    def _matchup_bonus(self, me, enemy):
-        my2 = self._secondary_kind(me) or "gun"
-        their = enemy.get("weapons") or []
-        their2 = next((k for k in their if k != "gun"), their[0] if their else "gun")
-        if self.beats.get(my2) == their2:
-            return 12.0
-        if self.beats.get(their2) == my2:
-            return -8.0
-        return 0.0
+    def _recent_dps(self, obs):
+        """How many damage events in last ~1 second (10 ticks)."""
+        tick = obs["tick"]
+        self.dmg_ticks = [t for t in self.dmg_ticks if tick - t < 10]
+        return len(self.dmg_ticks)
 
-    def _recent_damage(self, obs, ticks=10):
-        return sum(1 for e in obs.get("events", []) if e.get("type") == "damaged")
+    def _threat_direction(self, obs):
+        """Average direction enemies are coming from, or None."""
+        enemies = self._enemies(obs)
+        if not enemies:
+            return None
+        me = obs["self"]
+        fx, fy = 0.0, 0.0
+        for e in enemies[:5]:
+            d = max(self._dist2(me["pos"], e["pos"]), 1.0)
+            w = 1.0 / (d * d)   # inverse-square: close enemies matter WAY more
+            fx += (e["pos"][0] - me["pos"][0]) * w
+            fy += (e["pos"][1] - me["pos"][1]) * w
+        L = math.hypot(fx, fy)
+        if L < 0.001:
+            return None
+        return [fx / L, fy / L]
 
+    def _sound_threat(self, obs):
+        """Are there close sounds indicating approaching enemies we can't see?"""
+        near_sounds = sum(1 for s in obs["sounds"]
+                         if s["dist"] == "near" and s["kind"] in ("step", "gun", "mortar", "laser", "lightning"))
+        mid_sounds = sum(1 for s in obs["sounds"]
+                        if s["dist"] == "mid" and s["kind"] in ("step", "gun"))
+        return near_sounds + mid_sounds * 0.5
+
+    # =====================================================================
+    # UPGRADE SELECTION
+    # =====================================================================
     def _choose_upgrade(self, offer, me):
-        cubes = me["cubes"]
-        phase = "early" if cubes < 6 else "mid" if cubes < 15 else "late"
-        weights = {
-            "early": {"hp": 6, "health": 6, "armor": 6, "shield": 5, "speed": 4, "sensor": 3, "damage": 2},
-            "mid": {"armor": 5, "damage": 5, "fire": 4, "rate": 4, "sensor": 4, "hp": 3, "speed": 3},
-            "late": {"damage": 6, "fire": 5, "armor": 5, "hp": 4, "rate": 4},
+        # ALWAYS prioritize survival: hp, armor, speed, energy
+        # damage only matters late game
+        hp = self._hp(me)
+        prios = {
+            "hp": 8, "health": 8, "armor": 7, "shield": 7,
+            "repair": 6, "regen": 6, "speed": 6, "move": 5,
+            "energy": 5, "sensor": 3, "vision": 3,
+            "damage": 2, "fire": 2, "rate": 2, "reload": 1,
         }
-        prios = weights[phase]
-        hold = self._secondary_kind(me) or ""
+        if hp < 0.5:
+            prios["hp"] = 12
+            prios["health"] = 12
+            prios["repair"] = 10
+
         best_i, best_s = 0, -1
         for i, ch in enumerate(offer["choices"]):
             txt = (ch.get("name", "") + " " + ch.get("desc", "") + " " + ch.get("id", "")).lower()
             s = sum(v for k, v in prios.items() if k in txt)
-            if hold and hold in txt:
-                s += 4
             if s > best_s:
                 best_s, best_i = s, i
         return best_i
 
-    # --- scoring ---
+    # =====================================================================
+    # BEHAVIOR SCORING  —  THE KEY CHANGE: SURVIVAL FIRST
+    # =====================================================================
+
     def _score_zone(self, obs):
         me = obs["self"]
         margin = self._zone_margin(obs)
-        score = 5.0
+        # outside zone is an emergency, always
         if not me["in_zone"]:
-            score += 100.0
+            return 200.0
         if margin < 5:
-            score += 80.0
-        elif margin < 15:
-            score += 45.0
-        elif margin < 30:
-            score += 20.0
+            return 150.0
+        if margin < 15:
+            return 60.0
+        if margin < 30:
+            return 25.0
+        # zone shrinking soon?
         t = obs.get("t", 0)
-        if t > obs["zone"].get("shrink_start", 60) and margin < 40:
-            score += 15.0
-        return score
+        shrink = obs["zone"].get("shrink_start", 999)
+        if t > shrink - 5 and margin < 50:
+            return 40.0
+        return 5.0
 
     def _score_fight(self, obs):
+        """MUCH more conservative: only fight when cornered or easy kill available."""
         enemies = self._enemies(obs)
         if not enemies:
-            return -50.0
+            return -100.0
+
         me = obs["self"]
-        hp = self._hp_ratio(me)
-        nearest_d = self._dist2(me["pos"], enemies[0]["pos"])
-        nearby = self._nearby_enemies(obs, 40)
+        hp = self._hp(me)
+        nearest = enemies[0]
+        d = self._dist2(me["pos"], nearest["pos"])
+        nearby = self._nearby_count(obs, 40)
         alive = obs.get("alive", 16)
 
-        score = hp * 30.0
-        score += (1.0 - alive / 16.0) * 20.0
-        if self._secondary_kind(me):
+        # BASE: start negative — fighting is BAD in 1v15
+        score = -20.0
+
+        # only consider fighting if:
+        # 1) enemy is so close we can't run (cornered)
+        if d < 10:
+            score += 40.0  # forced engagement
+
+        # 2) enemy is very low HP (easy kill for cubes)
+        enemy_hp = nearest.get("hp", 999)
+        enemy_max = nearest.get("max_hp", 1400)
+        if enemy_hp < enemy_max * 0.2 and d < 35:
+            score += 50.0  # easy kill
+
+        # penalties
+        score -= nearby * 20.0           # multiple enemies = death
+        if hp < 0.4:
+            score -= 50.0                # low HP, don't fight
+        if not self._weapon2(me):
+            score -= 20.0                # no secondary, disadvantaged
+
+        # late game with few alive: more willing to fight
+        if alive <= 4:
+            score += 30.0
+        elif alive <= 8:
             score += 15.0
-        score += min(me["cubes"], 10) * 3.0
-        score -= nearby * 14.0
-        if nearest_d < 15:
-            score += 12.0
-        elif nearest_d < 50:
-            score += 6.0
-        elif nearest_d > 90:
-            score -= 15.0
-        score += self._matchup_bonus(me, enemies[0])
-        if hp < 0.35:
-            score -= 40.0
-        score -= self._recent_damage(obs) * 8.0
+
         return score
 
     def _score_flee(self, obs):
+        """MUCH higher priority: flee is the default safe behavior."""
         me = obs["self"]
-        hp = self._hp_ratio(me)
-        nearby = self._nearby_enemies(obs, 35)
-        score = (1.0 - hp) * 50.0
-        score += self._recent_damage(obs) * 18.0
-        score += max(0, nearby - 1) * 16.0
-        if me["energy"] < 25:
-            score += 10.0
-        score -= hp * 25.0
-        if nearby == 0:
-            score -= 30.0
+        hp = self._hp(me)
+        nearby = self._nearby_count(obs, 40)
+        dps = self._recent_dps(obs)
+        sounds = self._sound_threat(obs)
+
+        # base: always somewhat inclined to flee when enemies are near
+        score = 0.0
+
+        if nearby > 0:
+            score += 50.0                   # enemies visible = lean toward flee
+            score += (nearby - 1) * 25.0    # multiple enemies = very high flee
+        if dps > 0:
+            score += dps * 30.0             # actively taking damage = RUN
+        if hp < 0.6:
+            score += (1.0 - hp) * 60.0      # lower HP = more desperate to flee
+        if hp < 0.3:
+            score += 50.0                   # critical HP = maximum flee
+        if sounds > 1 and nearby == 0:
+            score += 20.0                   # enemies approaching, pre-evade!
+
+        # don't flee if nobody is around
+        if nearby == 0 and dps == 0 and sounds < 1:
+            score = -30.0
+
         return score
 
     def _score_loot_weapon(self, obs):
         me = obs["self"]
-        if self._secondary_kind(me):
-            return -20.0
-        if not obs["pickups"]:
-            return -30.0
+        if self._weapon2(me):
+            return -40.0  # already have secondary
+        picks = [p for p in obs["pickups"] if p["kind"] != "gun"]
+        if not picks:
+            return -50.0
+
         mep = me["pos"]
-        best_d = min(self._dist2(mep, p["pos"]) for p in obs["pickups"] if p["kind"] != "gun")
-        nearby_pick = [p for p in obs["pickups"] if p["kind"] != "gun" and self._dist2(mep, p["pos"]) < 80]
+        nearby_pick = [p for p in picks if self._dist2(mep, p["pos"]) < 60]
         if not nearby_pick:
-            return -25.0
+            return -40.0
+
         best = max(nearby_pick, key=lambda p: self.weapon_prio.get(p["kind"], 0))
-        score = 70.0 + self.weapon_prio.get(best["kind"], 0) * 10.0
-        score -= best_d * 0.4
-        if self._nearby_enemies(obs, 30) == 0:
-            score += 18.0
-        else:
-            score -= self._nearby_enemies(obs, 30) * 12.0
-        if obs.get("t", 0) < 90:
-            score += 15.0
+        d = self._dist2(mep, best["pos"])
+        score = 60.0 + self.weapon_prio.get(best["kind"], 0) * 8.0
+        score -= d * 0.5
+
+        # danger penalty
+        enemies_close = self._nearby_count(obs, 30)
+        score -= enemies_close * 25.0
+
+        # early game bonus: getting a weapon is critical
+        if obs.get("t", 0) < 60:
+            score += 25.0
+
         return score
 
     def _score_loot_cubes(self, obs):
         me = obs["self"]
-        need = me["cubes"] < self._next_upgrade_threshold(me)
         mep = me["pos"]
-        targets = list(obs["cubes"]) + [c for c in obs["crates"] if c["hp"] > 0]
+        targets = list(obs["cubes"]) + [c for c in obs["crates"] if c.get("hp", 0) > 0]
         if not targets:
-            return -40.0
+            return -50.0
+
         best_d = min(self._dist2(mep, t["pos"]) for t in targets)
-        score = (25.0 if need else 8.0) + 20.0 / max(best_d, 1.0)
-        score -= self._nearby_enemies(obs, 35) * 10.0
-        if obs.get("t", 0) > 200:
-            score *= 0.6
+        need = me["cubes"] < self._next_upgrade_cost(me)
+        score = (30.0 if need else 5.0) + 15.0 / max(best_d, 1.0)
+
+        enemies_close = self._nearby_count(obs, 35)
+        score -= enemies_close * 20.0
+
+        # late game: cubes matter less
+        if obs.get("t", 0) > 250:
+            score *= 0.4
         return score
 
     def _score_hunt_npc(self, obs):
         npcs = self._npcs(obs)
         if not npcs:
-            return -60.0
+            return -80.0
         me = obs["self"]
         t = obs.get("t", 0)
-        if t > 180:
-            return -40.0
+        if t > 150:
+            return -60.0  # NPCs are bait late game
         d = self._dist2(me["pos"], npcs[0]["pos"])
-        score = 35.0 * (1.0 - t / 420.0)
-        if me["cubes"] < 3:
-            score += 25.0
-        score -= d * 0.35
-        score -= self._nearby_enemies(obs, 45) * 18.0
+        score = 25.0 * (1.0 - t / 420.0)
+        if me["cubes"] < 3 and self._weapon2(me):
+            score += 20.0
+        score -= d * 0.4
+        # CRITICAL: don't hunt if enemies nearby
+        score -= self._nearby_count(obs, 50) * 30.0
         return score
 
-    def _score_highground(self, obs):
-        me = obs["self"]
-        z = me["pos"][2]
-        if z > 6.0:
-            return -15.0
-        if me["energy"] < 40:
-            return -25.0
-        nearby = self._nearby_enemies(obs, 80)
-        if nearby == 0:
+    def _score_evade(self, obs):
+        """NEW: proactive evasion — move unpredictably when enemies are in mid-range."""
+        enemies = self._enemies(obs)
+        if not enemies:
             return -20.0
-        score = 12.0 + nearby * 6.0
-        if self._secondary_kind(me) == "mortar":
-            score += 12.0
-        if not me.get("grounded", True):
-            return -10.0
-        return score
+        me = obs["self"]
+        nearest_d = self._dist2(me["pos"], enemies[0]["pos"])
+        nearby = self._nearby_count(obs, 60)
 
-    # --- movement overlays ---
+        # sweet spot: enemies visible but not on top of us
+        if 15 < nearest_d < 60 and nearby > 0:
+            score = 35.0 + nearby * 10.0
+            if self._hp(me) > 0.5:
+                score += 10.0  # healthy enough to kite, not desperate enough to flee
+            return score
+        return -15.0
+
+    # =====================================================================
+    # MOVEMENT — MUCH MORE UNPREDICTABLE
+    # =====================================================================
     def _strafe(self, base_dir):
         self.strafe_ticks += 1
         if self.strafe_ticks >= self.strafe_flip_at:
             self.strafe_dir *= -1
             self.strafe_ticks = 0
-            self.strafe_flip_at = self.rng.randint(6, 14)
+            self.strafe_flip_at = self.rng.randint(4, 10)  # faster flips
         if base_dir is None:
             return [0.0, 0.0]
         bx, by = base_dir
         perp = [-by * self.strafe_dir, bx * self.strafe_dir]
-        return self._clamp2([bx * 0.55 + perp[0] * 0.45, by * 0.55 + perp[1] * 0.45])
+        return self._clamp2([bx * 0.5 + perp[0] * 0.5, by * 0.5 + perp[1] * 0.5])
+
+    def _evasive_move(self, obs, base_dir):
+        """Add sinusoidal dodge overlay to make movement harder to predict."""
+        self.move_phase += 0.15 + self.rng.uniform(-0.03, 0.03)
+        sin_offset = math.sin(self.move_phase) * self.dodge_amplitude
+
+        if base_dir is None:
+            base_dir = [0.0, 1.0]
+        perp = self._perp(base_dir, self.strafe_dir)
+
+        # base movement + sinusoidal perpendicular weave
+        result = [
+            base_dir[0] * 0.6 + perp[0] * sin_offset,
+            base_dir[1] * 0.6 + perp[1] * sin_offset,
+        ]
+        return self._clamp2(result)
 
     def _dodge_dir(self, obs):
+        """Dodge projectiles AND laser charges aimed at us."""
         me = obs["self"]
         mx, my = me["pos"][0], me["pos"][1]
+
+        # check projectiles
         best_threat, best_dot = None, 0.0
         for p in obs["projectiles"]:
             dx, dy = mx - p["pos"][0], my - p["pos"][1]
@@ -278,6 +383,8 @@ class Bot:
         if best_threat:
             perp = self._norm2([-best_threat["vel"][1], best_threat["vel"][0]])
             return [perp[0] * self.strafe_dir, perp[1] * self.strafe_dir]
+
+        # check laser charges aimed at us
         for m in obs["mechs"]:
             if m["kind"] != "mech" or not m.get("charging"):
                 continue
@@ -286,51 +393,94 @@ class Bot:
             aim_yaw = m["aim"][0]
             aim_dx, aim_dy = math.cos(aim_yaw), math.sin(aim_yaw)
             to_me = self._norm2([mx - m["pos"][0], my - m["pos"][1]])
-            if aim_dx * to_me[0] + aim_dy * to_me[1] > 0.7:
+            if aim_dx * to_me[0] + aim_dy * to_me[1] > 0.6:
                 return self._norm2([-aim_dy, aim_dx])
+
+        # check beams that just fired near us
+        for b in obs.get("beams", []):
+            if b["age"] > 0.3:
+                continue
+            if len(b["path"]) < 2:
+                continue
+            # beam came close, dodge perpendicular to beam direction
+            p0, p1 = b["path"][0], b["path"][-1]
+            beam_dx = p1[0] - p0[0]
+            beam_dy = p1[1] - p0[1]
+            # check if beam passed near us
+            to_start = [mx - p0[0], my - p0[1]]
+            beam_len = math.hypot(beam_dx, beam_dy)
+            if beam_len < 0.1:
+                continue
+            # project our position onto beam line
+            t_proj = (to_start[0] * beam_dx + to_start[1] * beam_dy) / (beam_len * beam_len)
+            if 0 < t_proj < 1:
+                closest_x = p0[0] + beam_dx * t_proj
+                closest_y = p0[1] + beam_dy * t_proj
+                perp_dist = math.hypot(mx - closest_x, my - closest_y)
+                if perp_dist < 8:  # beam passed close
+                    return self._norm2([-beam_dy * self.strafe_dir, beam_dx * self.strafe_dir])
+
         return None
 
     def _apply_dodge(self, obs, move, boost=False):
         dodge = self._dodge_dir(obs)
         margin = self._zone_margin(obs)
         if dodge:
-            if margin < 8 or not obs["self"]["in_zone"]:
+            if margin < 10 or not obs["self"]["in_zone"]:
                 zone = self._toward(obs["self"]["pos"], obs["zone"]["next_center"])
-                move = self._blend(dodge, zone, 0.55, 0.45)
+                move = self._blend(dodge, zone, 0.5, 0.5)
             else:
                 move = dodge
             boost = True
         return move, boost
 
     def _zone_goal(self, obs):
+        """Position away from enemies within the zone."""
         me = obs["self"]
         c = obs["zone"]["next_center"]
         r = obs["zone"]["next_radius"]
+
+        # try to position on the OPPOSITE side of the zone from the threat
+        threat = self._threat_direction(obs)
+        if threat and r > 10:
+            # move to opposite side of zone from enemies
+            away = [-threat[0], -threat[1]]
+            target_r = r * 0.5
+            return [c[0] + away[0] * target_r, c[1] + away[1] * target_r, me["pos"][2]]
+
+        # fallback: aim for ~55% from center, in our current direction
         dx = me["pos"][0] - c[0]
         dy = me["pos"][1] - c[1]
         d = math.hypot(dx, dy)
         if d < 1.0:
             a = self.rng.uniform(0, 2 * math.pi)
             dx, dy, d = math.cos(a), math.sin(a), 1.0
-        s = r * self.zone_target_pct / d
+        s = r * 0.55 / d
         return [c[0] + dx * s, c[1] + dy * s, me["pos"][2]]
 
     def _flee_dir(self, obs, enemies):
         me = obs["self"]
+        # inverse-square weighted repulsion from enemies
         fx, fy = 0.0, 0.0
-        for e in enemies[:4]:
+        for e in enemies[:6]:
             d = max(self._dist2(me["pos"], e["pos"]), 1.0)
-            w = 1.0 / d
+            w = 1.0 / (d * d)
             fx += (me["pos"][0] - e["pos"][0]) * w
             fy += (me["pos"][1] - e["pos"][1]) * w
         flee = self._norm2([fx, fy])
+
+        # blend with zone direction based on how close to edge
         zone_dir = self._toward(me["pos"], self._zone_goal(obs))
         margin = self._zone_margin(obs)
-        if margin < 25:
-            return self._blend(flee, zone_dir, 0.35, 0.65)
-        return self._blend(flee, zone_dir, 0.65, 0.35)
+        if margin < 15:
+            return self._blend(flee, zone_dir, 0.25, 0.75)
+        elif margin < 30:
+            return self._blend(flee, zone_dir, 0.45, 0.55)
+        return self._blend(flee, zone_dir, 0.7, 0.3)
 
-    # --- combat ---
+    # =====================================================================
+    # COMBAT
+    # =====================================================================
     def _lead(self, me, tgt):
         dist = self._dist2(me["pos"], tgt["pos"])
         w0 = me["weapons"][0]
@@ -343,7 +493,7 @@ class Bot:
         return [
             tgt["pos"][0] + tgt["vel"][0] * t,
             tgt["pos"][1] + tgt["vel"][1] * t,
-            tgt["pos"][2] + tgt["vel"][2] * t * 0.5,
+            tgt["pos"][2] + tgt["vel"][2] * t * 0.4,
         ]
 
     def _aim_at(self, me, pos):
@@ -351,20 +501,6 @@ class Bot:
         hd = self._dist2(me["pos"], pos)
         pitch = math.atan2(pos[2] - me["pos"][2] - 2.5, max(hd, 0.1))
         return [yaw, pitch]
-
-    def _best_fight_target(self, obs):
-        me = obs["self"]
-        candidates = []
-        for e in self._enemies(obs):
-            d = self._dist2(me["pos"], e["pos"])
-            if d > 120:
-                continue
-            hp_score = 1.0 - (e["hp"] / max(e.get("max_hp", 1400), 1.0))
-            candidates.append((hp_score * 40 - d * 0.15, e))
-        if not candidates:
-            enemies = self._enemies(obs)
-            return enemies[0] if enemies else None
-        return max(candidates, key=lambda x: x[0])[1]
 
     def _fire_slots(self, me, dist):
         f = [False, False]
@@ -376,10 +512,14 @@ class Bot:
             k = w["kind"]
             if cd > 0 and k != "laser":
                 continue
-            if k == "lightning" and dist > 42:
+            if k == "gun" and w.get("ammo", 1) <= 0:
+                continue
+            if k == "lightning" and dist > 40:
                 continue
             if k == "mortar" and dist < 8:
                 continue
+            if k == "gun" and dist > 50:
+                continue  # gun is inaccurate at long range, save ammo
             f[slot] = True
         return f
 
@@ -401,47 +541,95 @@ class Bot:
             return best, worst_i
         return None, None
 
-    # --- behavior executors ---
+    # =====================================================================
+    # BEHAVIOR EXECUTORS
+    # =====================================================================
     def _exec_zone(self, obs, act):
         me = obs["self"]
         urgent = not me["in_zone"] or self._zone_margin(obs) < 15
         dest = obs["zone"]["next_center"] if urgent else self._zone_goal(obs)
-        act["move"] = self._toward(me["pos"], dest)
+        base = self._toward(me["pos"], dest)
+        act["move"] = self._evasive_move(obs, base) if not urgent else base
         act["boost"] = urgent
         if urgent and me.get("grounded"):
-            act["jump"] = obs["tick"] % 18 == 0
+            act["jump"] = obs["tick"] % 12 == 0
 
     def _exec_fight(self, obs, act):
         me = obs["self"]
-        tgt = self._best_fight_target(obs)
-        if not tgt:
+        enemies = self._enemies(obs)
+        if not enemies:
             self._exec_zone(obs, act)
             return
+        # pick weakest nearby enemy (easiest kill)
+        candidates = [(e, self._dist2(me["pos"], e["pos"])) for e in enemies if self._dist2(me["pos"], e["pos"]) < 60]
+        if candidates:
+            # prefer low HP targets
+            tgt = min(candidates, key=lambda x: x[0].get("hp", 999))[0]
+        else:
+            tgt = enemies[0]
+
         d = self._dist2(me["pos"], tgt["pos"])
         pred = self._lead(me, tgt)
         act["aim"] = self._aim_at(me, pred)
-        ideal = 28.0 if self._secondary_kind(me) == "lightning" else 45.0
-        if d > ideal + 8:
-            act["move"] = self._strafe(self._toward(me["pos"], pred))
-            act["boost"] = d > 55
-        elif d < ideal - 10:
+
+        # kite: maintain distance, never rush in
+        ideal = 30.0
+        if d > ideal + 10:
+            act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
+        elif d < ideal - 5:
             away = self._norm2([me["pos"][0] - tgt["pos"][0], me["pos"][1] - tgt["pos"][1]])
-            act["move"] = self._strafe(away)
+            act["move"] = self._evasive_move(obs, away)
         else:
-            act["move"] = self._strafe(self._toward(me["pos"], pred))
+            # circle strafe at ideal range
+            to_tgt = self._norm2([tgt["pos"][0] - me["pos"][0], tgt["pos"][1] - me["pos"][1]])
+            act["move"] = self._clamp2(self._perp(to_tgt, self.strafe_dir))
+
         act["fire"] = self._fire_slots(me, d)
-        if any(act["fire"]):
+        act["boost"] = d < 15  # boost to escape if too close
+        if any(act.get("fire", [])):
             mf.draw.line(me["pos"], tgt["pos"], "#ff5040")
 
     def _exec_flee(self, obs, act):
         enemies = self._enemies(obs)
+        me = obs["self"]
         if enemies:
-            act["move"] = self._strafe(self._flee_dir(obs, enemies))
-            act["aim"] = self._aim_at(obs["self"], enemies[0]["pos"])
+            flee = self._flee_dir(obs, enemies)
+            act["move"] = self._evasive_move(obs, flee)
+            # shoot behind us while running (suppressive fire)
+            if enemies and self._dist2(me["pos"], enemies[0]["pos"]) < 35:
+                pred = self._lead(me, enemies[0])
+                act["aim"] = self._aim_at(me, pred)
+                act["fire"] = self._fire_slots(me, self._dist2(me["pos"], enemies[0]["pos"]))
         else:
-            self._exec_zone(obs, act)
+            # fleeing from sounds/damage, just move erratically toward zone
+            goal = self._zone_goal(obs)
+            act["move"] = self._evasive_move(obs, self._toward(me["pos"], goal))
+
         act["boost"] = True
-        if obs["tick"] % 14 == 0:
+        # reactive jumping: jump when taking damage, not on fixed timer
+        if self._recent_dps(obs) > 0 and me.get("grounded") and me["energy"] > 20:
+            act["jump"] = True
+
+    def _exec_evade(self, obs, act):
+        """Proactive evasion: enemies in mid range, move unpredictably toward safety."""
+        me = obs["self"]
+        goal = self._zone_goal(obs)
+        base = self._toward(me["pos"], goal)
+        act["move"] = self._evasive_move(obs, base)
+        act["boost"] = False  # conserve energy
+
+        # aim at nearest enemy but don't fire unless they're close
+        enemies = self._enemies(obs)
+        if enemies:
+            tgt = enemies[0]
+            d = self._dist2(me["pos"], tgt["pos"])
+            pred = self._lead(me, tgt)
+            act["aim"] = self._aim_at(me, pred)
+            if d < 35:
+                act["fire"] = self._fire_slots(me, d)
+
+        # occasional jump to throw off aim prediction
+        if obs["tick"] % 25 == 0 and me.get("grounded") and me["energy"] > 30:
             act["jump"] = True
 
     def _exec_loot_weapon(self, obs, act):
@@ -450,9 +638,10 @@ class Bot:
         if not picks:
             self._exec_zone(obs, act)
             return
-        dest = min(picks, key=lambda p: self._dist2(me["pos"], p["pos"]))
-        act["move"] = self._strafe(self._toward(me["pos"], dest["pos"]))
-        act["boost"] = self._dist2(me["pos"], dest["pos"]) > 35
+        dest = max(picks, key=lambda p: self.weapon_prio.get(p["kind"], 0) / max(self._dist2(me["pos"], p["pos"]), 1))
+        base = self._toward(me["pos"], dest["pos"])
+        act["move"] = self._evasive_move(obs, base)
+        act["boost"] = self._dist2(me["pos"], dest["pos"]) > 30
         pickup, drop_slot = self._try_pickup(me, obs["pickups"])
         if pickup:
             act["take"] = pickup["id"]
@@ -466,9 +655,11 @@ class Bot:
             self._exec_zone(obs, act)
             return
         dest = min(targets, key=lambda t: self._dist2(me["pos"], t["pos"]))
-        act["move"] = self._strafe(self._toward(me["pos"], dest["pos"]))
-        act["boost"] = self._dist2(me["pos"], dest["pos"]) > 40
-        if "hp" in dest:
+        base = self._toward(me["pos"], dest["pos"])
+        act["move"] = self._evasive_move(obs, base)
+        act["boost"] = self._dist2(me["pos"], dest["pos"]) > 35
+        # shoot crates
+        if dest.get("hp", 0) > 0:
             act["aim"] = self._aim_at(me, dest["pos"])
             act["fire"] = self._fire_slots(me, self._dist2(me["pos"], dest["pos"]))
 
@@ -481,33 +672,34 @@ class Bot:
         me = obs["self"]
         d = self._dist2(me["pos"], tgt["pos"])
         pred = self._lead(me, tgt)
-        act["move"] = self._strafe(self._toward(me["pos"], pred) if d > 25 else self._norm2(
-            [me["pos"][0] - tgt["pos"][0], me["pos"][1] - tgt["pos"][1]]))
+        base = self._toward(me["pos"], pred) if d > 20 else self._norm2(
+            [me["pos"][0] - tgt["pos"][0], me["pos"][1] - tgt["pos"][1]])
+        act["move"] = self._evasive_move(obs, base)
         act["aim"] = self._aim_at(me, pred)
         act["fire"] = self._fire_slots(me, d)
 
-    def _exec_highground(self, obs, act):
-        me = obs["self"]
-        enemies = self._enemies(obs)
-        if enemies:
-            act["aim"] = self._aim_at(me, enemies[0]["pos"])
-        base = self._toward(me["pos"], self._zone_goal(obs))
-        act["move"] = base
-        act["boost"] = True
-        if me.get("grounded") and obs["tick"] % 25 == 0:
-            act["jump"] = True
-
+    # =====================================================================
+    # STATE TRACKING
+    # =====================================================================
     def _update_state(self, obs):
         me = obs["self"]
+        tick = obs["tick"]
         for e in obs.get("events", []):
             if e.get("type") == "kill":
                 self.kill_count += 1
+            if e.get("type") == "damaged":
+                self.dmg_ticks.append(tick)
+                self.last_damage_bearing = e.get("bearing")
+
         if self.last_pos and self._dist2(me["pos"], self.last_pos) < 0.1:
             self.stuck_ticks += 1
         else:
             self.stuck_ticks = 0
         self.last_pos = list(me["pos"])
 
+    # =====================================================================
+    # MAIN TICK
+    # =====================================================================
     def act(self, obs: mf.Observation) -> mf.Action:
         act: mf.Action = {"tick": obs["tick"]}
         me = obs["self"]
@@ -516,42 +708,45 @@ class Bot:
         if obs["offer"]:
             act["pick"] = self._choose_upgrade(obs["offer"], me)
 
+        # always pick up nearby weapons opportunistically
         pickup, drop_slot = self._try_pickup(me, obs["pickups"])
         if pickup:
             act["take"] = pickup["id"]
             if drop_slot is not None:
                 act["drop"] = drop_slot
 
-        if self.stuck_ticks > 20:
+        # unstuck
+        if self.stuck_ticks > 15:
             a = self.rng.uniform(0, 2 * math.pi)
             act.update(move=[math.cos(a), math.sin(a)], boost=True, jump=True)
             self.stuck_ticks = 0
             mf.draw.label("UNSTICK")
             return act
 
+        # score all behaviors
         scores = {
-            "zone": self._score_zone(obs),
-            "fight": self._score_fight(obs),
-            "flee": self._score_flee(obs),
+            "zone":        self._score_zone(obs),
+            "fight":       self._score_fight(obs),
+            "flee":        self._score_flee(obs),
+            "evade":       self._score_evade(obs),
             "loot_weapon": self._score_loot_weapon(obs),
-            "loot_cubes": self._score_loot_cubes(obs),
-            "hunt_npc": self._score_hunt_npc(obs),
-            "highground": self._score_highground(obs),
+            "loot_cubes":  self._score_loot_cubes(obs),
+            "hunt_npc":    self._score_hunt_npc(obs),
         }
         behavior = max(scores, key=scores.get)
-        self.current_behavior = behavior
 
         executors = {
-            "zone": self._exec_zone,
-            "fight": self._exec_fight,
-            "flee": self._exec_flee,
+            "zone":        self._exec_zone,
+            "fight":       self._exec_fight,
+            "flee":        self._exec_flee,
+            "evade":       self._exec_evade,
             "loot_weapon": self._exec_loot_weapon,
-            "loot_cubes": self._exec_loot_cubes,
-            "hunt_npc": self._exec_hunt_npc,
-            "highground": self._exec_highground,
+            "loot_cubes":  self._exec_loot_cubes,
+            "hunt_npc":    self._exec_hunt_npc,
         }
         executors[behavior](obs, act)
 
+        # apply projectile dodge overlay (overrides movement if dodging)
         if "move" not in act:
             act["move"] = [0.0, 0.0]
         move, boost = self._apply_dodge(obs, act.get("move", [0.0, 0.0]), act.get("boost", False))
@@ -559,23 +754,28 @@ class Bot:
         if boost:
             act["boost"] = True
 
+        # always face enemies if we're not aiming at something else
         if "aim" not in act:
             enemies = self._enemies(obs)
             if enemies:
                 act["aim"] = self._aim_at(me, enemies[0]["pos"])
-            else:
-                act["aim"] = act.get("aim", me.get("aim", [0.0, 0.0]))
+            elif obs["sounds"]:
+                s = min(obs["sounds"],
+                        key=lambda s: 0 if s["dist"] == "near" else 1 if s["dist"] == "mid" else 2)
+                act["aim"] = [s["bearing"], 0.0]
 
+        # auto-reload
         w0 = me["weapons"][0]
         if w0 and w0["kind"] == "gun" and w0.get("ammo", 1) == 0 and not act.get("fire", [False])[0]:
             act["reload"] = True
 
+        # debug HUD
         margin = self._zone_margin(obs)
         top = sorted(scores.items(), key=lambda x: -x[1])[:3]
         mf.draw.label(
-            f"{behavior} | hp {self._hp_ratio(me):.0%} | "
-            f"scores {top[0][1]:.0f}/{top[1][1]:.0f} | zone {margin:+.0f}m | "
-            f"k{self.kill_count} c{me['cubes']}"
+            f"{behavior} {top[0][1]:.0f}|{top[1][1]:.0f}|{top[2][1]:.0f} "
+            f"hp{self._hp(me):.0%} z{margin:+.0f} "
+            f"k{self.kill_count} a{obs['alive']}"
         )
         return act
 
