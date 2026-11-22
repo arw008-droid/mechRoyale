@@ -231,6 +231,12 @@ class Bot:
         # v5: early-game sprint target
         self._sprint_target = None
 
+        # v5: accuracy — two sliding windows, same time range, ratio = accuracy
+        self._fire_log = []   # [(tick, slot), ...] — every shot we fire
+        self._hit_log = []    # [tick, ...] — every hit event we receive
+        self._accuracy = 0.5  # ratio, starts neutral
+        self._ACC_WINDOW = 50  # ticks (~5 seconds)
+
         # Extract useful config values
         mech_cfg = self.config.get("mech", {})
         self.rear_mult = mech_cfg.get("rear_mult", 1.5)
@@ -507,6 +513,12 @@ class Bot:
         # v5: late-game aggression when few alive (need to fight eventually)
         if alive <= 5 and hp > 0.5:
             score += 20.0
+
+        # v5: accuracy-based engagement — if shots aren't landing, don't fight
+        if self._accuracy < 0.15 and nearest_d > 25:
+            score -= 20.0  # missing badly at range, disengage
+        elif self._accuracy > 0.4:
+            score += 10.0  # shots landing well, stay aggressive
 
         return score
 
@@ -1141,8 +1153,19 @@ class Bot:
             if e.get("type") == "damaged":
                 self.dmg_ticks.append(tick)
                 self._last_damaged_tick = tick
+            if e.get("type") == "hit":
+                self._hit_log.append(tick)
         # "taking fire" = damaged in last 2 seconds (20 ticks)
         self._taking_fire = (tick - self._last_damaged_tick) < 20
+
+        # --- accuracy: shots fired vs hits landed in same window ---
+        self._fire_log = [t for t in self._fire_log if tick - t[0] < self._ACC_WINDOW]
+        self._hit_log = [t for t in self._hit_log if tick - t < self._ACC_WINDOW]
+        shots = len(self._fire_log)
+        hits = len(self._hit_log)
+        if shots >= 3:
+            self._accuracy = hits / shots
+        # else keep previous value (not enough data)
 
         if self.last_pos and self._d2(me["pos"], self.last_pos) < 0.1:
             self.stuck_ticks += 1
@@ -1249,6 +1272,12 @@ class Bot:
                                       1 if s["dist"] == "mid" else 2)
                 act["aim"] = [s["bearing"], 0.0]
 
+        # log fired shots — just (tick, slot), same window as hits
+        fire_flags = act.get("fire", [])
+        for slot, firing in enumerate(fire_flags):
+            if firing:
+                self._fire_log.append((obs["tick"], slot))
+
         w0 = me["weapons"][0]
         if w0 and w0["kind"] == "gun" and w0.get("ammo", 1) == 0 \
            and not act.get("fire", [False])[0]:
@@ -1261,7 +1290,7 @@ class Bot:
         mf.draw.label(
             f"{behavior} {top[0][1]:.0f}|{top[1][1]:.0f}|{top[2][1]:.0f} "
             f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} {fire_status} "
-            f"k{self.kill_count} a{obs['alive']}"
+            f"acc{self._accuracy:.0%} k{self.kill_count} a{obs['alive']}"
         )
         return act
 
