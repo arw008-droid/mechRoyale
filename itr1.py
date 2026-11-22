@@ -6,6 +6,16 @@ import os
 import random
 import mechfight as mf
 
+# ---------------------------------------------------------------------------
+# A/B knobs: practice seeds are fixed, so change ONE of these per submission.
+# ---------------------------------------------------------------------------
+TUNE = {
+    "outnumbered_pen": 20.0,   # fight-score penalty per extra enemy (35 = back off at 2v1)
+    "recover_hp": 0.85,        # start hiding to regen below this hp fraction
+    "lone_bonus": 25.0,        # how hard to commit to 1v1s
+    "weapon_prio": {"lightning": 4, "laser": 3, "mortar": 2, "gun": 1},
+}
+
 
 # =========================================================================
 # ARENA MAP
@@ -98,7 +108,10 @@ class ArenaMap:
         if zone_center:
             my_zone_dist = math.hypot(mx - zone_center[0], my_ - zone_center[1])
 
+        mz = my_pos[2] if len(my_pos) > 2 else None
         for prism in self.nearby(mx, my_, max_dist):
+            if mz is not None and (prism["top"] < mz + 8.0 or prism["base"] > mz + 1.0):
+                continue                    # too low to hide behind, or overhead
             pcx, pcy = prism["cx"], prism["cy"]
             verts = prism["verts"]
             n = len(verts)
@@ -138,16 +151,23 @@ class ArenaMap:
                     best_sc, best = dist, (cx_, cy_)
         return best
 
-    def is_blocked(self, x, y):
+    def is_blocked(self, x, y, z=None):
         for p in self.nearby(x, y, 5):
+            if z is not None and (p["top"] <= z + 1.2 or p["base"] >= z + 9.0):
+                continue                    # we can step onto it / walk under it
             if self._pip(x, y, p["verts"]):
                 return True
         return False
 
-    def has_los(self, fx, fy, tx, ty):
+    def has_los(self, fx, fy, tx, ty, fz=None, tz=None):
+        """fz/tz: heights of the two ends of the sight line (eye, target center)."""
         mid_x, mid_y = (fx + tx) * 0.5, (fy + ty) * 0.5
         rad = math.hypot(tx - fx, ty - fy) * 0.5 + 10
+        lo = min(fz, tz) if fz is not None and tz is not None else None
+        hi = max(fz, tz) if lo is not None else None
         for p in self.nearby(mid_x, mid_y, rad):
+            if lo is not None and (p["top"] < lo or p["base"] > hi):
+                continue                    # line passes over / under it
             verts = p["verts"]
             n = len(verts)
             for i in range(n):
@@ -157,20 +177,20 @@ class ArenaMap:
                     return False
         return True
 
-    def steer_around(self, mx, my_, tx, ty, step=6.0):
+    def steer_around(self, mx, my_, tx, ty, step=6.0, z=None):
         dx, dy = tx - mx, ty - my_
         d = math.hypot(dx, dy)
         if d < 1:
             return None
         ndx, ndy = dx / d, dy / d
         chk = min(step, d)
-        if not self.is_blocked(mx + ndx * chk, my_ + ndy * chk):
+        if not self.is_blocked(mx + ndx * chk, my_ + ndy * chk, z):
             return None
         for angle in (0.6, -0.6, 1.1, -1.1, 1.6, -1.6):
             ca, sa = math.cos(angle), math.sin(angle)
             sx_ = ndx * ca - ndy * sa
             sy_ = ndx * sa + ndy * ca
-            if not self.is_blocked(mx + sx_ * step, my_ + sy_ * step):
+            if not self.is_blocked(mx + sx_ * step, my_ + sy_ * step, z):
                 return (sx_, sy_)
         return None
 
@@ -199,7 +219,7 @@ class ArenaMap:
 # BOT
 # =========================================================================
 class Bot:
-    name = "ghost-v5"
+    name = "ghost-v6"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
@@ -208,7 +228,7 @@ class Bot:
         self.weapon_cfgs = self.config["weapons"]
         # lightning: ~240 dps inside 45 m (60 dmg / 0.25 s) and shorts lasers;
         # laser: ~130 dps at 280 m; mortar: area denial, weak vs movers.
-        self.weapon_prio = {"lightning": 4, "laser": 3, "mortar": 2, "gun": 1}
+        self.weapon_prio = dict(TUNE["weapon_prio"])
         self.beats = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
         self.upgrade_defs = {u["id"]: u for u in self.config.get("upgrades", [])}
         self.gravity = abs(self.weapon_cfgs.get("mortar", {}).get("gravity", 22.0))
@@ -378,8 +398,9 @@ class Bot:
         if not enemies:
             return True
         me = obs["self"]
-        return not self.arena.has_los(me["pos"][0], me["pos"][1],
-                                      enemies[0]["pos"][0], enemies[0]["pos"][1])
+        e = enemies[0]
+        return not self.arena.has_los(me["pos"][0], me["pos"][1], e["pos"][0], e["pos"][1],
+                                      e["pos"][2] + 8.0, me["pos"][2] + 4.5)
 
     def _get_cover(self, obs):
         tick = obs["tick"]
@@ -500,9 +521,9 @@ class Bot:
         score += (hp - thp) * 30.0          # finish weak targets, avoid fresh ones when hurt
 
         if nearby <= 1:
-            score += 25.0                   # lone hunter: this is where points come from
+            score += TUNE["lone_bonus"]     # lone hunter: this is where points come from
         else:
-            score -= (nearby - 1) * 20.0
+            score -= (nearby - 1) * TUNE["outnumbered_pen"]
         if nearest_d > 90:
             score -= 15.0
         if hp < 0.25 and thp > hp:
@@ -562,7 +583,8 @@ class Bot:
             if self._d2(me["pos"], e["pos"]) > 230:
                 continue
             if not self.arena.loaded or self.arena.has_los(
-                    me["pos"][0], me["pos"][1], e["pos"][0], e["pos"][1]):
+                    me["pos"][0], me["pos"][1], e["pos"][0], e["pos"][1],
+                    e["pos"][2] + 8.0, me["pos"][2] + 4.5):
                 return True
         return False
 
@@ -572,7 +594,7 @@ class Bot:
         being ganked: break LOS, heal, take them as they come around the corner."""
         me = obs["self"]
         hp = self._hp(me)
-        if hp > 0.85 or not me["in_zone"] or self._zone_margin(obs) < 10:
+        if hp > TUNE["recover_hp"] or not me["in_zone"] or self._zone_margin(obs) < 10:
             return -60.0
         if self._recently_hit(obs, 2.0) or self._any_enemy_los(obs):
             return -60.0
@@ -624,19 +646,29 @@ class Bot:
         return score
 
     def _score_loot_cubes(self, obs):
-        """SAME as v1."""
+        """Loose cubes (kill/NPC drops) are free: +4% max HP and damage each, and
+        picking them up doesn't reset regen. Crates cost a fight-free few seconds
+        of shooting, which does reset regen, so only when healthy."""
         me = obs["self"]
-        need = me["cubes"] < self._next_up_cost(me)
         mep = me["pos"]
-        targets = list(obs["cubes"]) + [c for c in obs["crates"] if c.get("hp", 0) > 0]
-        if not targets:
-            return -40.0
-        best_d = min(self._d2(mep, t["pos"]) for t in targets)
-        score = (25.0 if need else 8.0) + 20.0 / max(best_d, 1.0)
-        score -= self._nearby_count(obs, 35) * 10.0
-        if obs.get("t", 0) > 200:
-            score *= 0.6
-        return score
+        need = me["cubes"] < self._next_up_cost(me)
+        near_enemy = self._nearby_count(obs, 35)
+        best = -40.0
+        if obs["cubes"]:
+            d = min(self._d2(mep, c["pos"]) for c in obs["cubes"])
+            if d < 60:
+                s = 70.0 - d * 0.5 - near_enemy * 20.0
+                if me["cubes"] < 10:
+                    s += 10.0               # still under stat_cap
+                best = max(best, s)
+        crates = [c for c in obs["crates"] if c.get("hp", 0) > 0]
+        if crates and self._hp(me) > 0.85:
+            d = min(self._d2(mep, c["pos"]) for c in crates)
+            s = (25.0 if need else 8.0) + 20.0 / max(d, 1.0) - near_enemy * 10.0
+            if obs.get("t", 0) > 200:
+                s *= 0.6
+            best = max(best, s)
+        return best
 
     def _score_hunt_npc(self, obs):
         """SAME as v1."""
@@ -744,7 +776,7 @@ class Bot:
         me = obs["self"]
         steer = self.arena.steer_around(
             me["pos"][0], me["pos"][1],
-            me["pos"][0] + move[0] * 6, me["pos"][1] + move[1] * 6)
+            me["pos"][0] + move[0] * 6, me["pos"][1] + move[1] * 6, z=me["pos"][2])
         if steer:
             return self._c2([steer[0], steer[1]])
         return move
@@ -759,9 +791,9 @@ class Bot:
             away = [-threat[0], -threat[1]]
             target_r = r * 0.5
             goal = [c[0] + away[0] * target_r, c[1] + away[1] * target_r]
-            if self.arena.loaded and self.arena.is_blocked(goal[0], goal[1]):
+            if self.arena.loaded and self.arena.is_blocked(goal[0], goal[1], me["pos"][2]):
                 steer = self.arena.steer_around(me["pos"][0], me["pos"][1],
-                                                 goal[0], goal[1])
+                                                 goal[0], goal[1], z=me["pos"][2])
                 if steer:
                     goal = [me["pos"][0] + steer[0] * target_r,
                             me["pos"][1] + steer[1] * target_r]
@@ -1064,16 +1096,23 @@ class Bot:
 
     def _exec_loot_cubes(self, obs, act):
         me = obs["self"]
-        targets = list(obs["cubes"]) + [c for c in obs["crates"] if c.get("hp", 0) > 0]
-        if not targets:
+        if obs["cubes"]:
+            dest = min(obs["cubes"], key=lambda t: self._d2(me["pos"], t["pos"]))
+            if self._d2(me["pos"], dest["pos"]) < 60:
+                act["move"] = self._toward(me["pos"], dest["pos"])
+                act["boost"] = self._d2(me["pos"], dest["pos"]) > 15 and me["energy"] > 40
+                return
+        crates = [c for c in obs["crates"] if c.get("hp", 0) > 0]
+        if not crates:
             self._exec_zone(obs, act)
             return
-        dest = min(targets, key=lambda t: self._d2(me["pos"], t["pos"]))
+        dest = min(crates, key=lambda t: self._d2(me["pos"], t["pos"]))
+        d = self._d2(me["pos"], dest["pos"])
         act["move"] = self._evasive_move(obs, self._toward(me["pos"], dest["pos"]))
-        act["boost"] = self._d2(me["pos"], dest["pos"]) > 40
-        if dest.get("hp", 0) > 0:
-            act["aim"] = self._aim_at(me, [dest["pos"][0], dest["pos"][1], dest["pos"][2] + 0.5])
-            act["fire"] = self._fire_slots(me, self._d2(me["pos"], dest["pos"]))
+        act["boost"] = d > 40
+        aim = self._aim_at(me, [dest["pos"][0], dest["pos"][1], dest["pos"][2] + 0.5])
+        act["aim"] = aim
+        act["fire"] = self._fire_slots(me, d, self._aim_error(me, aim))
 
     def _exec_recover(self, obs, act):
         me = obs["self"]
@@ -1084,7 +1123,12 @@ class Bot:
         elif self.mem:
             threat = min(self.mem.values(), key=lambda v: self._d2(me["pos"], v[0]))[0]
         cover = self._get_cover(obs) if enemies else None
-        if cover and math.hypot(cover[0] - me["pos"][0], cover[1] - me["pos"][1]) > 4:
+        cubes = [c for c in obs["cubes"] if self._d2(me["pos"], c["pos"]) < 20]
+        if cubes:
+            # loose cubes don't reset regen; scoop them up
+            c = min(cubes, key=lambda c: self._d2(me["pos"], c["pos"]))
+            act["move"] = self._toward(me["pos"], c["pos"])
+        elif cover and math.hypot(cover[0] - me["pos"][0], cover[1] - me["pos"][1]) > 4:
             act["move"] = self._toward(me["pos"], cover)
             act["move"] = [act["move"][0] * 0.4, act["move"][1] * 0.4]   # < step_speed: silent
         else:
