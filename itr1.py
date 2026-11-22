@@ -1,7 +1,8 @@
-"""v6: v4 base + 3 mechanical-only upgrades (no scoring changes):
-  1. Better lead prediction: 2-iteration + correct weapon slot speed
-  2. Accuracy tracking: sliding window → adjust fight engagement
-  3. Supply drop awareness: free cubes + HP repair
+"""v7: v6 mechanics + guerrilla tactics
+  - Lightning+mortar priority, tight fire ranges (no long-range pot shots)
+  - Phase-based: early=hunt isolates, late=zone+kill
+  - Target isolation bonus, kill-and-relocate
+  - All v6 mechanical upgrades (2-iter lead, accuracy tracking, supply drops)
 """
 import json
 import math
@@ -179,14 +180,16 @@ class ArenaMap:
 # BOT
 # =========================================================================
 class Bot:
-    name = "ghost-v6"
+    name = "ghost-v7"
 
     def __init__(self, hello: mf.Hello):
         self.config = hello["config"]
         self.reach = self.config["loot"]["pickup_radius"]
         self.rng = random.Random(hello["seed"])
         self.weapon_cfgs = self.config["weapons"]
-        self.weapon_prio = {"laser": 4, "lightning": 3, "mortar": 2, "gun": 1}
+
+        # v7: lightning+mortar priority
+        self.weapon_prio = {"lightning": 4, "mortar": 3, "laser": 2, "gun": 1}
         self.beats = {"laser": "mortar", "mortar": "lightning", "lightning": "laser"}
 
         self.arena = ArenaMap()
@@ -198,22 +201,23 @@ class Bot:
         self.stuck_ticks = 0
         self.kill_count = 0
 
-        # v2 additions
         self.dmg_ticks = []
         self.move_phase = 0.0
         self.dodge_amplitude = self.rng.uniform(0.3, 0.6)
 
-        # cover cache
         self._cover_pt = None
         self._cover_tick = -99
 
-        # === NEW v6: accuracy tracking ===
-        self.fire_log = []   # list of tick numbers when we fired
-        self.hit_log = []    # list of tick numbers when hits confirmed
-        self.accuracy = 0.5  # start optimistic
+        # v6: accuracy tracking
+        self.fire_log = []
+        self.hit_log = []
+        self.accuracy = 0.5
+
+        # v7: kill-and-relocate cooldown
+        self.last_kill_tick = -99
 
     # =====================================================================
-    # VECTOR MATH  (unchanged)
+    # VECTOR MATH
     # =====================================================================
     def _d2(self, a, b):  return math.dist(a[:2], b[:2])
     def _d3(self, a, b):  return math.dist(a[:3], b[:3])
@@ -238,7 +242,7 @@ class Bot:
         return [-v[1] * d, v[0] * d]
 
     # =====================================================================
-    # QUERIES  (unchanged from v4)
+    # QUERIES
     # =====================================================================
     def _enemies(self, obs):
         me = obs["self"]
@@ -353,32 +357,38 @@ class Bot:
         self._cover_tick = tick
         return self._cover_pt
 
-    # === NEW v6: accuracy tracking ===
-    def _update_accuracy(self, obs):
-        """Two independent sliding windows over 50 ticks."""
-        tick = obs["tick"]
-        window = 50  # 5 seconds at 10 ticks/sec
+    # v7: check if a target is "isolated" (no allies near them)
+    def _is_isolated(self, obs, target):
+        """True if target has no other enemies within 30m of them."""
+        count = 0
+        for e in self._enemies(obs):
+            if e is target:
+                continue
+            if self._d2(e["pos"], target["pos"]) < 30:
+                count += 1
+        return count == 0
 
-        # log fires this tick
-        fire = obs.get("self", {})
-        # We detect fires by checking if fire action was taken (tracked in act())
-        # Hits come from events
+    # v7: game phase — early (many alive) vs late (few alive)
+    def _is_late_game(self, obs):
+        alive = obs.get("alive", 16)
+        return alive <= 8
+
+    # v6: accuracy tracking
+    def _update_accuracy(self, obs):
+        tick = obs["tick"]
+        window = 50
         for e in obs.get("events", []):
             if e.get("type") == "hit":
                 self.hit_log.append(tick)
-
-        # prune old entries
         self.fire_log = [t for t in self.fire_log if tick - t < window]
         self.hit_log = [t for t in self.hit_log if tick - t < window]
-
         fires = len(self.fire_log)
         hits = len(self.hit_log)
         if fires >= 3:
             self.accuracy = hits / fires
-        # else keep previous accuracy (don't update on too few samples)
 
     # =====================================================================
-    # UPGRADE — more survival-biased than v1  (unchanged)
+    # UPGRADE — survival-biased (unchanged)
     # =====================================================================
     def _choose_upgrade(self, offer, me):
         hp = self._hp(me)
@@ -400,7 +410,7 @@ class Bot:
         return best_i
 
     # =====================================================================
-    # SCORING — IDENTICAL to v4 except accuracy modifier in fight
+    # SCORING — v4 base + guerrilla modifiers
     # =====================================================================
 
     def _score_zone(self, obs):
@@ -426,16 +436,17 @@ class Bot:
             return -50.0
         me = obs["self"]
         hp = self._hp(me)
-        nearest_d = self._d2(me["pos"], enemies[0]["pos"])
+        nearest = enemies[0]
+        nearest_d = self._d2(me["pos"], nearest["pos"])
         nearby = self._nearby_count(obs, 40)
         alive = obs.get("alive", 16)
+        tick = obs["tick"]
 
         score = hp * 30.0
         score += (1.0 - alive / 16.0) * 20.0
         if self._w2(me):
             score += 15.0
         score += min(me["cubes"], 10) * 3.0
-
         score -= nearby * 18.0
 
         if nearest_d < 15:
@@ -445,7 +456,7 @@ class Bot:
         elif nearest_d > 90:
             score -= 15.0
 
-        score += self._matchup_bonus(me, enemies[0])
+        score += self._matchup_bonus(me, nearest)
 
         if hp < 0.35:
             score -= 40.0
@@ -457,13 +468,35 @@ class Bot:
         if nearby >= 3:
             score -= 20.0
 
-        # === NEW v6: accuracy-based adjustment ===
-        # Only kicks in after enough samples (fire_log >= 3)
+        # v6: accuracy adjustment
         if len(self.fire_log) >= 3:
             if self.accuracy < 0.15 and nearest_d > 25:
-                score -= 20.0   # missing badly at range → disengage
+                score -= 20.0
             elif self.accuracy > 0.40:
-                score += 10.0   # landing shots → stay aggressive
+                score += 10.0
+
+        # === v7 guerrilla modifiers ===
+
+        # HUGE bonus for isolated targets (the ambush moment)
+        if self._is_isolated(obs, nearest):
+            score += 25.0
+            # extra bonus if they're close (within lightning range)
+            if nearest_d < 42:
+                score += 15.0
+        else:
+            # target has friends nearby — penalize in early game
+            if not self._is_late_game(obs):
+                score -= 15.0
+
+        # kill-and-relocate: suppress fight for 15 ticks after a kill
+        # (grab loot then reposition, don't get greedy)
+        if not self._is_late_game(obs) and tick - self.last_kill_tick < 15:
+            score -= 25.0
+
+        # v7: don't shoot beyond 42m in early game (no pot shots)
+        # In late game, full v4 ranges apply
+        if not self._is_late_game(obs) and nearest_d > 42:
+            score -= 30.0
 
         return score
 
@@ -484,6 +517,10 @@ class Bot:
 
         if sounds > 1 and nearby == 0:
             score += 15.0
+
+        # v7: in early game, flee harder from groups (save HP for ambushes)
+        if not self._is_late_game(obs) and nearby >= 2:
+            score += 20.0
 
         return score
 
@@ -532,7 +569,32 @@ class Bot:
     def _score_loot_weapon(self, obs):
         me = obs["self"]
         if self._w2(me):
+            # v7: still pick up better weapons even when we have 2
+            # Check if any nearby pickup is higher priority than our worst
+            picks = [p for p in obs["pickups"] if p["kind"] != "gun"]
+            if not picks:
+                return -20.0
+            mep = me["pos"]
+            nearby_pick = [p for p in picks if self._d2(mep, p["pos"]) < 40]
+            if not nearby_pick:
+                return -20.0
+            best = max(nearby_pick, key=lambda p: self.weapon_prio.get(p["kind"], 0))
+            # check if it's better than our worst weapon
+            w0_prio = self.weapon_prio.get(
+                me["weapons"][0]["kind"] if me["weapons"][0] else "gun", 1)
+            w1_prio = self.weapon_prio.get(
+                self._w2(me) or "gun", 1)
+            worst_prio = min(w0_prio, w1_prio)
+            if self.weapon_prio.get(best["kind"], 0) > worst_prio:
+                best_d = self._d2(mep, best["pos"])
+                score = 50.0 + self.weapon_prio.get(best["kind"], 0) * 10.0
+                score -= best_d * 0.5
+                if self._nearby_count(obs, 30) > 0:
+                    score -= 20.0
+                return score
             return -20.0
+
+        # don't have secondary yet — same as v4 but with v7 prios
         picks = [p for p in obs["pickups"] if p["kind"] != "gun"]
         if not picks:
             return -30.0
@@ -565,6 +627,12 @@ class Bot:
         score -= self._nearby_count(obs, 35) * 10.0
         if obs.get("t", 0) > 200:
             score *= 0.6
+
+        # v7: after a kill, boost cube collection (grab the death drops!)
+        tick = obs["tick"]
+        if tick - self.last_kill_tick < 20:
+            score += 20.0
+
         return score
 
     def _score_hunt_npc(self, obs):
@@ -583,9 +651,8 @@ class Bot:
         score -= self._nearby_count(obs, 45) * 18.0
         return score
 
-    # === NEW v6: supply drop scoring ===
+    # v6: supply drop scoring
     def _score_drop(self, obs):
-        """Score going after supply drops for free cubes + HP repair."""
         drops = obs.get("drops", [])
         if not drops:
             return -60.0
@@ -594,40 +661,29 @@ class Bot:
         hp = self._hp(me)
         margin = self._zone_margin(obs)
 
-        # don't chase drops when zone is dangerous
         if margin < 10 or not me["in_zone"]:
             return -50.0
 
-        # find best drop: landed (or about to land) and close
         best_drop = None
         best_score = -100.0
         for drop in drops:
             d = self._d2(mep, drop["pos"])
             if d > 100:
-                continue  # too far
-
-            # skip drops still falling for a while
+                continue
             if drop["lands_in"] > 5.0:
                 continue
-
-            # skip drops someone else is capturing and has progress
             if drop["holder"] is not None and drop["holder"] != me.get("id") \
                and drop["progress"] > 0.3:
                 continue
 
             ds = 0.0
-            # closer is better
             ds += max(0, 60 - d) * 0.8
-            # drops give cubes (useful if we need upgrades)
             if me["cubes"] < self._next_up_cost(me):
                 ds += 25.0
-            # drops give repair (useful if hurt)
             if hp < 0.7:
                 ds += (1.0 - hp) * 30.0
-            # already landing / on ground
             if drop["lands_in"] <= 0:
                 ds += 15.0
-            # progress we've already made
             ds += drop["progress"] * 20.0
 
             if ds > best_score:
@@ -638,11 +694,9 @@ class Bot:
             return -50.0
 
         score = best_score
-        # penalize for enemies nearby (dangerous to stand still capturing)
         nearby = self._nearby_count(obs, 40)
         score -= nearby * 15.0
 
-        # bonus in mid-game when upgrades matter most
         t = obs.get("t", 0)
         if 60 < t < 240:
             score += 10.0
@@ -650,7 +704,7 @@ class Bot:
         return score
 
     # =====================================================================
-    # MOVEMENT — UPGRADED from v1  (unchanged from v4)
+    # MOVEMENT  (unchanged from v4)
     # =====================================================================
     def _evasive_move(self, obs, base_dir):
         self.strafe_ticks += 1
@@ -786,10 +840,9 @@ class Bot:
         return self._blend(flee, zone_dir, 0.65, 0.35)
 
     # =====================================================================
-    # COMBAT — v6: 2-iteration lead + correct weapon slot
+    # COMBAT — v6 lead + v7 tighter ranges
     # =====================================================================
     def _weapon_speed(self, me, slot=0):
-        """Get projectile speed for a specific weapon slot."""
         w = me["weapons"][slot] if slot < len(me["weapons"]) else None
         if w is None:
             return 80.0
@@ -799,19 +852,16 @@ class Bot:
         return self.weapon_cfgs.get(kind, {}).get("speed", 80)
 
     def _lead(self, me, tgt, slot=0):
-        """v6: 2-iteration lead prediction using correct weapon slot speed."""
         speed = self._weapon_speed(me, slot)
         pos = tgt["pos"]
         vel = tgt["vel"]
 
-        # iteration 1: predict based on current distance
         dist = self._d2(me["pos"], pos)
         t = dist / max(speed, 1.0)
         pred = [pos[0] + vel[0] * t,
                 pos[1] + vel[1] * t,
                 pos[2] + vel[2] * t * 0.5]
 
-        # iteration 2: refine using predicted position distance
         dist2 = self._d2(me["pos"], pred)
         t2 = dist2 / max(speed, 1.0)
         pred2 = [pos[0] + vel[0] * t2,
@@ -834,13 +884,15 @@ class Bot:
             if d > 120:
                 continue
             hp_score = 1.0 - (e["hp"] / max(e.get("max_hp", 1400), 1.0))
-            candidates.append((hp_score * 40 - d * 0.15, e))
+            iso_bonus = 15.0 if self._is_isolated(obs, e) else 0.0
+            candidates.append((hp_score * 40 - d * 0.15 + iso_bonus, e))
         if not candidates:
             enemies = self._enemies(obs)
             return enemies[0] if enemies else None
         return max(candidates, key=lambda x: x[0])[1]
 
     def _fire_slots(self, me, dist):
+        """v7: tighter ranges — gun 45m, lightning 42m, mortar 8-50m."""
         f = [False, False]
         for slot in (0, 1):
             w = me["weapons"][slot] if slot < len(me["weapons"]) else None
@@ -852,12 +904,14 @@ class Bot:
                 continue
             if k == "gun" and w.get("ammo", 1) <= 0:
                 continue
-            if k == "gun" and dist > 50:
-                continue
+            if k == "gun" and dist > 45:
+                continue          # v7: tighter than v4's 50
             if k == "lightning" and dist > 42:
                 continue
             if k == "mortar" and dist < 8:
                 continue
+            if k == "mortar" and dist > 55:
+                continue          # v7: don't mortar beyond 55m
             f[slot] = True
         return f
 
@@ -879,7 +933,7 @@ class Bot:
         return None, None
 
     # =====================================================================
-    # EXECUTORS  (v4 unchanged + new drop executor)
+    # EXECUTORS
     # =====================================================================
     def _exec_zone(self, obs, act):
         me = obs["self"]
@@ -899,8 +953,6 @@ class Bot:
             return
         d = self._d2(me["pos"], tgt["pos"])
 
-        # v6: use slot-aware lead for aiming
-        # Determine which slot will actually fire for best aim
         fire = self._fire_slots(me, d)
         aim_slot = 0
         if not fire[0] and fire[1]:
@@ -908,11 +960,19 @@ class Bot:
         pred = self._lead(me, tgt, slot=aim_slot)
         act["aim"] = self._aim_at(me, pred)
 
-        ideal = 28.0 if self._w2(me) == "lightning" else 45.0
-        if d > ideal + 8:
+        # v7: preferred engagement range based on weapons
+        # lightning wants ~25m, mortar wants ~30-40m
+        has_lightning = any(
+            me["weapons"][s]["kind"] == "lightning"
+            for s in range(len(me["weapons"]))
+            if me["weapons"][s]
+        )
+        ideal = 25.0 if has_lightning else 40.0
+
+        if d > ideal + 10:
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
-            act["boost"] = d > 55
-        elif d < ideal - 10:
+            act["boost"] = d > 50
+        elif d < ideal - 8:
             away = self._n2([me["pos"][0] - tgt["pos"][0],
                              me["pos"][1] - tgt["pos"][1]])
             act["move"] = self._evasive_move(obs, away)
@@ -967,11 +1027,14 @@ class Bot:
 
     def _exec_loot_weapon(self, obs, act):
         me = obs["self"]
+        # v7: find best weapon by our priority
         picks = [p for p in obs["pickups"] if p["kind"] != "gun"]
         if not picks:
             self._exec_zone(obs, act)
             return
-        dest = min(picks, key=lambda p: self._d2(me["pos"], p["pos"]))
+        # sort by our priority (lightning > mortar > laser > gun)
+        picks.sort(key=lambda p: self.weapon_prio.get(p["kind"], 0), reverse=True)
+        dest = picks[0]
         act["move"] = self._evasive_move(obs, self._toward(me["pos"], dest["pos"]))
         act["boost"] = self._d2(me["pos"], dest["pos"]) > 35
         pickup, drop = self._try_pickup(me, obs["pickups"])
@@ -1008,16 +1071,13 @@ class Bot:
         act["aim"] = self._aim_at(me, pred)
         act["fire"] = self._fire_slots(me, d)
 
-    # === NEW v6: supply drop executor ===
     def _exec_drop(self, obs, act):
-        """Move to best supply drop and capture it."""
         drops = obs.get("drops", [])
         me = obs["self"]
         if not drops:
             self._exec_zone(obs, act)
             return
 
-        # pick closest landed drop within range
         best = None
         best_d = 999.0
         for drop in drops:
@@ -1032,17 +1092,14 @@ class Bot:
             self._exec_zone(obs, act)
             return
 
-        # move toward the drop
         base = self._toward(me["pos"], best["pos"])
         act["move"] = self._evasive_move(obs, base)
         act["boost"] = best_d > 20
 
-        # stand still inside capture radius for faster capture
         if best_d < best.get("radius", 5):
             act["move"] = [0.0, 0.0]
             act["boost"] = False
 
-        # still aim at nearest enemy and shoot if close
         enemies = self._enemies(obs)
         if enemies:
             tgt = enemies[0]
@@ -1052,7 +1109,6 @@ class Bot:
             if ed < 40:
                 act["fire"] = self._fire_slots(me, ed)
 
-        # reactive jump while capturing
         if self._recent_dps(obs) > 0 and me.get("grounded") and me["energy"] > 20:
             act["jump"] = True
 
@@ -1067,6 +1123,7 @@ class Bot:
         for e in obs.get("events", []):
             if e.get("type") == "kill":
                 self.kill_count += 1
+                self.last_kill_tick = tick      # v7: track for relocate
             if e.get("type") == "damaged":
                 self.dmg_ticks.append(tick)
         if self.last_pos and self._d2(me["pos"], self.last_pos) < 0.1:
@@ -1075,7 +1132,6 @@ class Bot:
             self.stuck_ticks = 0
         self.last_pos = list(me["pos"])
 
-        # v6: update accuracy tracking
         self._update_accuracy(obs)
 
     # =====================================================================
@@ -1110,7 +1166,7 @@ class Bot:
             "loot_weapon": self._score_loot_weapon(obs),
             "loot_cubes":  self._score_loot_cubes(obs),
             "hunt_npc":    self._score_hunt_npc(obs),
-            "drop":        self._score_drop(obs),          # NEW v6
+            "drop":        self._score_drop(obs),
         }
         behavior = max(scores, key=scores.get)
 
@@ -1122,7 +1178,7 @@ class Bot:
             "loot_weapon": self._exec_loot_weapon,
             "loot_cubes":  self._exec_loot_cubes,
             "hunt_npc":    self._exec_hunt_npc,
-            "drop":        self._exec_drop,                # NEW v6
+            "drop":        self._exec_drop,
         }
         executors[behavior](obs, act)
 
@@ -1151,7 +1207,7 @@ class Bot:
            and not act.get("fire", [False])[0]:
             act["reload"] = True
 
-        # === v6: log fires for accuracy tracking ===
+        # v6: log fires for accuracy tracking
         tick = obs["tick"]
         if any(act.get("fire", [])):
             self.fire_log.append(tick)
@@ -1159,10 +1215,11 @@ class Bot:
         margin = self._zone_margin(obs)
         top = sorted(scores.items(), key=lambda x: -x[1])[:3]
         behind = "C" if self._behind_cover(obs) else "X"
+        phase = "LATE" if self._is_late_game(obs) else "HUNT"
         mf.draw.label(
             f"{behavior} {top[0][1]:.0f}|{top[1][1]:.0f}|{top[2][1]:.0f} "
             f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} "
-            f"k{self.kill_count} a{obs['alive']} acc{self.accuracy:.0%}"
+            f"k{self.kill_count} a{obs['alive']} {phase} acc{self.accuracy:.0%}"
         )
         return act
 
