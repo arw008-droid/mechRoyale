@@ -2,6 +2,7 @@
   - Lightning+mortar priority, tight fire ranges (no long-range pot shots)
   - Phase-based: early=hunt isolates, late=zone+kill
   - Target isolation bonus, kill-and-relocate
+  - Enemy aim: ambush unaware targets, relax flee/cover when not spotted
   - All v6 mechanical upgrades (2-iter lead, accuracy tracking, supply drops)
 """
 import json
@@ -368,6 +369,36 @@ class Bot:
                 count += 1
         return count == 0
 
+    def _enemy_aim_dot(self, me, enemy):
+        """+1 = enemy aim aligned toward us; negative = facing away."""
+        aim = enemy.get("aim")
+        if not aim:
+            return 0.0
+        yaw = aim[0]
+        adx, ady = math.cos(yaw), math.sin(yaw)
+        to_me = self._n2([me["pos"][0] - enemy["pos"][0],
+                          me["pos"][1] - enemy["pos"][1]])
+        return adx * to_me[0] + ady * to_me[1]
+
+    def _is_looking_away(self, me, enemy, threshold=0.3):
+        return self._enemy_aim_dot(me, enemy) < threshold
+
+    def _is_looking_at_me(self, me, enemy, threshold=0.7):
+        return self._enemy_aim_dot(me, enemy) > threshold
+
+    def _any_enemy_aiming_at_me(self, obs, radius=45.0):
+        me = obs["self"]
+        for e in self._enemies(obs):
+            if self._d2(me["pos"], e["pos"]) > radius:
+                continue
+            if self._is_looking_at_me(me, e):
+                return True
+        return False
+
+    def _ambush_target(self, obs, enemy):
+        me = obs["self"]
+        return self._is_isolated(obs, enemy) and self._is_looking_away(me, enemy)
+
     # v7: game phase — early (many alive) vs late (few alive)
     def _is_late_game(self, obs):
         alive = obs.get("alive", 16)
@@ -488,6 +519,13 @@ class Bot:
             if not self._is_late_game(obs):
                 score -= 15.0
 
+        if self._is_looking_away(me, nearest):
+            score += 18.0
+            if self._is_isolated(obs, nearest):
+                score += 10.0
+        elif self._is_looking_at_me(me, nearest) and nearest_d < 50:
+            score -= 8.0
+
         # kill-and-relocate: suppress fight for 15 ticks after a kill
         # (grab loot then reposition, don't get greedy)
         if not self._is_late_game(obs) and tick - self.last_kill_tick < 15:
@@ -495,7 +533,8 @@ class Bot:
 
         # v7: don't shoot beyond 42m in early game (no pot shots)
         # In late game, full v4 ranges apply
-        if not self._is_late_game(obs) and nearest_d > 42:
+        early_range = 55.0 if self._is_looking_away(me, nearest) else 42.0
+        if not self._is_late_game(obs) and nearest_d > early_range:
             score -= 30.0
 
         return score
@@ -521,6 +560,9 @@ class Bot:
         # v7: in early game, flee harder from groups (save HP for ambushes)
         if not self._is_late_game(obs) and nearby >= 2:
             score += 20.0
+
+        if nearby > 0 and not self._any_enemy_aiming_at_me(obs, radius=45):
+            score -= 12.0
 
         return score
 
@@ -563,6 +605,9 @@ class Bot:
 
         if margin < 30:
             score -= (30.0 - margin) * 1.0
+
+        if not self._any_enemy_aiming_at_me(obs, radius=50):
+            score -= 15.0
 
         return score
 
@@ -885,7 +930,10 @@ class Bot:
                 continue
             hp_score = 1.0 - (e["hp"] / max(e.get("max_hp", 1400), 1.0))
             iso_bonus = 15.0 if self._is_isolated(obs, e) else 0.0
-            candidates.append((hp_score * 40 - d * 0.15 + iso_bonus, e))
+            away_bonus = 12.0 if self._is_looking_away(me, e) else 0.0
+            ambush_bonus = 25.0 if self._ambush_target(obs, e) else 0.0
+            candidates.append(
+                (hp_score * 40 - d * 0.15 + iso_bonus + away_bonus + ambush_bonus, e))
         if not candidates:
             enemies = self._enemies(obs)
             return enemies[0] if enemies else None
@@ -968,6 +1016,9 @@ class Bot:
             if me["weapons"][s]
         )
         ideal = 25.0 if has_lightning else 40.0
+        ambush = self._is_looking_away(me, tgt)
+        if ambush:
+            ideal -= 10.0
 
         if d > ideal + 10:
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
@@ -979,6 +1030,8 @@ class Bot:
         else:
             act["move"] = self._evasive_move(obs, self._toward(me["pos"], pred))
         act["fire"] = fire
+        if ambush and d > ideal + 5:
+            act["fire"] = [False, False]
         if any(act.get("fire", [])):
             mf.draw.line(me["pos"], tgt["pos"], "#ff5040")
 
@@ -1216,9 +1269,16 @@ class Bot:
         top = sorted(scores.items(), key=lambda x: -x[1])[:3]
         behind = "C" if self._behind_cover(obs) else "X"
         phase = "LATE" if self._is_late_game(obs) else "HUNT"
+        enemies = self._enemies(obs)
+        if enemies and self._ambush_target(obs, enemies[0]):
+            spot = "A"
+        elif enemies and self._is_looking_at_me(me, enemies[0]):
+            spot = "!"
+        else:
+            spot = "-"
         mf.draw.label(
             f"{behavior} {top[0][1]:.0f}|{top[1][1]:.0f}|{top[2][1]:.0f} "
-            f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} "
+            f"hp{self._hp(me):.0%} z{margin:+.0f} {behind} {spot} "
             f"k{self.kill_count} a{obs['alive']} {phase} acc{self.accuracy:.0%}"
         )
         return act
